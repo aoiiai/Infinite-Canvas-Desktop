@@ -49,7 +49,7 @@ window.ResultDock = (function () {
 .rd-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 16px; }
 .rd-empty {
     padding: 22px 0; text-align: center; font-size: 12px; font-weight: 700;
-    color: #c7ccd4; border: 1px dashed rgba(0, 0, 0, 0.12); border-radius: 16px;
+    color: #c7ccd4;
 }
 .rd-item {
     position: relative; border-radius: 18px; overflow: hidden; display: flex; flex-direction: column;
@@ -90,7 +90,7 @@ html.studio-theme-dark .rd-count { color: #4b5563; }
 html.studio-theme-dark .rd-hint { color: #4b5563; }
 .rd-hint { font-size: 11px; font-weight: 600; color: #6b7280; white-space: nowrap; }
 html.studio-theme-dark .rd-x:hover { background: rgba(255, 255, 255, 0.1); color: #f3f4f6; }
-html.studio-theme-dark .rd-empty { color: #6b7280; border-color: rgba(255, 255, 255, 0.14); }
+html.studio-theme-dark .rd-empty { color: #6b7280; }
 html.studio-theme-dark .rd-item { border-color: rgba(255, 255, 255, 0.08); background: #1f2937; }
 html.studio-theme-dark .rd-rec { border-color: rgba(255, 255, 255, 0.1); }
 html.studio-theme-dark .rd-rec:hover { background: rgba(255, 255, 255, 0.04); }
