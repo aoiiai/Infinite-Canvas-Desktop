@@ -3133,6 +3133,161 @@ def check_update() -> dict:
     return out
 
 
+# ---------- 从自己的仓库应用更新（2026-09-28）----------
+# 「一键更新」走这里：把 update_source.json 的 version_url 解析出仓库 → 下载 zip → 校验 →
+# 先在 AI-Studio-Data\update_backups\ 留还原点 → 替换白名单文件（main.py / VERSION /
+# AI-Studio-Desktop.pyw / AI-Studio-Backend.py / static/**）。
+# ⚠ 绝不能让用户走 main.py 的 /api/update-from-github：那条路硬编码拉原作者仓库
+#   （hero8152/Infinite-Canvas），会把定制页面全部冲回原版。
+# ⚠ 用户数据一律不碰：AI-Studio-Data\、data\、workflows\custom\、python\、assets\ 都不在白名单里。
+_UPDATE_ALLOWED_ROOT_FILES = {"main.py", "VERSION", "AI-Studio-Desktop.pyw", "AI-Studio-Backend.py"}
+_UPDATE_ZIP_MAX = 400 * 1024 * 1024      # 更新包下载/单文件解压上限
+_UPDATE_ENTRIES_MAX = 8000               # 解压条目上限（zip 炸弹保护）
+_UPDATE_BACKUP_KEEP = 10                 # 还原点保留个数（与 main.py 的口径一致）
+
+
+def _update_repo_from_url(url: str):
+    """从 raw 的 VERSION 地址解析 codeload zip 地址与仓库标识；解析不出返回 (None, '')。"""
+    m = re.match(r"^https?://raw\.githubusercontent\.com/([^/]+)/([^/]+)/([^/]+)/VERSION/?$",
+                 str(url or "").strip())
+    if not m:
+        return None, ""
+    return ("https://codeload.github.com/%s/%s/zip/refs/heads/%s" % (m.group(1), m.group(2), m.group(3)),
+            "%s/%s@%s" % (m.group(1), m.group(2), m.group(3)))
+
+
+def _update_file_allowed(rel: str) -> bool:
+    rel = str(rel or "").replace("\\", "/").lstrip("/")
+    return rel in _UPDATE_ALLOWED_ROOT_FILES or rel.startswith("static/")
+
+
+def apply_update(force: bool = False) -> dict:
+    cur = _read_project_version()
+    url = ""
+    try:
+        with open(os.path.join(state_dir(), _UPDATE_CONFIG_FILE), "r", encoding="utf-8") as fh:
+            cfg = json.load(fh)
+        if isinstance(cfg, dict):
+            url = str(cfg.get("version_url") or "").strip()
+    except Exception:
+        pass
+    if not url:
+        return {"ok": False, "error": "还没配更新源（AI-Studio-Data\\update_source.json 的 version_url）"}
+    zip_url, repo_id = _update_repo_from_url(url)
+    if not zip_url:
+        return {"ok": False, "error": "version_url 不是 GitHub raw 的 VERSION 地址，解析不出仓库"}
+    import urllib.request as _ur
+    import zipfile as _zf
+    staging = os.path.join(state_dir(), "update_staging")
+    shutil.rmtree(staging, ignore_errors=True)
+    os.makedirs(staging, exist_ok=True)
+    # 1) 下载仓库 zip（流式落盘 + 总量上限）
+    try:
+        req = _ur.Request(zip_url, headers={"User-Agent": "AI-Studio-Desktop"})
+        with _ur.urlopen(req, timeout=90) as resp, open(os.path.join(staging, "repo.zip"), "wb") as out:
+            total = 0
+            while True:
+                chunk = resp.read(256 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > _UPDATE_ZIP_MAX:
+                    raise RuntimeError("更新包超过 %d MB，已中止" % (_UPDATE_ZIP_MAX // 1024 // 1024))
+                out.write(chunk)
+    except Exception as exc:
+        shutil.rmtree(staging, ignore_errors=True)
+        return {"ok": False, "error": "下载失败：%s" % exc}
+    # 2) 解压白名单文件（剥掉仓库根目录一层；路径穿越保护）
+    try:
+        with _zf.ZipFile(os.path.join(staging, "repo.zip")) as zf:
+            names = zf.namelist()
+            if not names or len(names) > _UPDATE_ENTRIES_MAX:
+                raise RuntimeError("更新包含 %d 个条目，超出保护上限" % len(names))
+            top = names[0].split("/")[0]
+            for info in zf.infolist():
+                rel = info.filename.replace("\\", "/")
+                if rel.startswith(top + "/"):
+                    rel = rel[len(top) + 1:]
+                if not rel or rel.endswith("/"):
+                    continue
+                if rel.lstrip("/").startswith("/") or ".." in rel.split("/"):
+                    raise RuntimeError("更新包含可疑路径，已中止")
+                if not _update_file_allowed(rel):
+                    continue
+                target = os.path.join(staging, *rel.split("/"))
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                with zf.open(info) as src, open(target, "wb") as dst:
+                    shutil.copyfileobj(src, dst, 256 * 1024)
+    except Exception as exc:
+        shutil.rmtree(staging, ignore_errors=True)
+        return {"ok": False, "error": "解压失败：%s" % exc}
+    # 3) 校验 staging：VERSION 必须在、static/ 必须非空
+    try:
+        with open(os.path.join(staging, "VERSION"), "r", encoding="utf-8") as fh:
+            latest = (fh.read().strip().splitlines() or [""])[0].strip()
+    except Exception:
+        latest = ""
+    staged_static = os.path.join(staging, "static")
+    staged_static_count = sum(len(fs) for _, _, fs in os.walk(staged_static)) if os.path.isdir(staged_static) else 0
+    if not latest or not staged_static_count:
+        shutil.rmtree(staging, ignore_errors=True)
+        return {"ok": False, "error": "更新包不完整（缺 VERSION 或 static/ 为空），已取消"}
+    if not force and not _ver_newer(latest, cur):
+        shutil.rmtree(staging, ignore_errors=True)
+        return {"ok": False, "current": cur, "latest": latest,
+                "error": "已是最新（%s），无需更新" % (cur or "?")}
+    # 4) 还原点：当前将被替换的文件先备份
+    backups_root = os.path.join(state_dir(), "update_backups")
+    os.makedirs(backups_root, exist_ok=True)
+    backup_dir = os.path.join(backups_root, time.strftime("%Y%m%d-%H%M%S"))
+    os.makedirs(backup_dir, exist_ok=True)
+    for name in _UPDATE_ALLOWED_ROOT_FILES:
+        p = os.path.join(PROJECT_DIR, name)
+        if os.path.isfile(p):
+            shutil.copy2(p, os.path.join(backup_dir, name))
+    if os.path.isdir(os.path.join(PROJECT_DIR, "static")):
+        shutil.copytree(os.path.join(PROJECT_DIR, "static"), os.path.join(backup_dir, "static"))
+    olds = sorted(d for d in os.listdir(backups_root) if os.path.isdir(os.path.join(backups_root, d)))
+    while len(olds) > _UPDATE_BACKUP_KEEP:
+        shutil.rmtree(os.path.join(backups_root, olds.pop(0)), ignore_errors=True)
+    # 5) 应用：先根文件（逐个原子替换），再 static/ 整目录替换（上游删掉的本地也删）
+    updated = []
+    try:
+        for name in sorted(_UPDATE_ALLOWED_ROOT_FILES):
+            src = os.path.join(staging, name)
+            if not os.path.isfile(src):
+                continue
+            dst = os.path.join(PROJECT_DIR, name)
+            tmp = dst + ".update_tmp"
+            shutil.copy2(src, tmp)
+            os.replace(tmp, dst)
+            updated.append(name)
+        shutil.rmtree(os.path.join(PROJECT_DIR, "static"))
+        shutil.copytree(staged_static, os.path.join(PROJECT_DIR, "static"))
+        updated.append("static/（%d 个文件）" % staged_static_count)
+    except Exception as exc:
+        # 失败即回滚：根文件用还原点覆盖回去，static/ 整目录从还原点恢复
+        try:
+            for name in updated:
+                if name.startswith("static/"):
+                    continue
+                b = os.path.join(backup_dir, name)
+                if os.path.isfile(b):
+                    shutil.copy2(b, os.path.join(PROJECT_DIR, name))
+            b_static = os.path.join(backup_dir, "static")
+            if os.path.isdir(b_static):
+                shutil.rmtree(os.path.join(PROJECT_DIR, "static"), ignore_errors=True)
+                shutil.copytree(b_static, os.path.join(PROJECT_DIR, "static"))
+        except Exception:
+            pass
+        shutil.rmtree(staging, ignore_errors=True)
+        return {"ok": False, "error": "应用更新失败，已回滚到还原点：%s" % exc}
+    shutil.rmtree(staging, ignore_errors=True)
+    return {"ok": True, "repo": repo_id, "current": cur, "latest": latest,
+            "updated": updated, "backup": os.path.basename(backup_dir),
+            "restart_required": True, "message": "已更新到 %s，请重启应用" % latest}
+
+
 class _HelperHandler(BaseHTTPRequestHandler):
     server_version = "AIStudioHelper"
 
@@ -3249,6 +3404,9 @@ class _HelperHandler(BaseHTTPRequestHandler):
                 return self._json(seedance_bridge_generate(self._body_json(), self.headers.get("Authorization") or ""))
             if path == "/v1/images/edits":
                 return self._json({"error": {"message": "桥接暂不支持图生图：原版会用 multipart 传本地图，而 seedance 只收公网图片 URL。先用文生图，或给桥接加一步图床上传。"}}, 501)
+            if path == "/apply-update":
+                body = self._body_json() or {}
+                return self._json(apply_update(force=bool(body.get("force"))))
             return self._json({"error": "not found"}, 404)
         except Exception as exc:
             return self._json({"error": str(exc)}, 500)

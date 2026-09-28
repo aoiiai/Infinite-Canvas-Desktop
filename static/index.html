@@ -2486,8 +2486,53 @@
             if(event.key === 'Escape') closeProjectUpdateModal();
         });
 
+        // 一键更新（2026-09-28 改链路）：不再开原版更新弹窗 —— 那条路（/api/update-from-github）
+        // 硬编码拉原作者仓库 hero8152/Infinite-Canvas，会把定制页面全部冲回原版；
+        // 改走本机助手 /apply-update：从 update_source.json 配的自己的仓库下载并应用，
+        // 只替换 main.py / VERSION / AI-Studio-Desktop.pyw / AI-Studio-Backend.py / static/**，
+        // 更新前自动在 AI-Studio-Data\update_backups\ 留还原点，用户数据一律不碰。
+        // 交互用「两击确认」：第一击查版本，有新版才武装按钮（文案变「确认更新 vX」，8 秒不点自动复位）。
+        let updateBtnArmTimer = null;
+        function resetUpdateBtn() {
+            const btn = document.getElementById('update-now-btn');
+            const txt = document.getElementById('update-now-text');
+            if (btn) delete btn.dataset.latest;
+            if (txt) txt.textContent = updateUiText('一键更新', 'One-click Update');
+            if (updateBtnArmTimer) { clearTimeout(updateBtnArmTimer); updateBtnArmTimer = null; }
+        }
         async function runProjectUpdate() {
-            openProjectUpdateModal();
+            const btn = document.getElementById('update-now-btn');
+            const txt = document.getElementById('update-now-text');
+            if (!btn || !txt) return;
+            if (btn.dataset.latest) {                      // 已武装 → 第二击：真正执行
+                const latest = btn.dataset.latest;
+                resetUpdateBtn();
+                updateCheckToast('正在下载并应用更新…（约需几十秒，别关窗口）');
+                try {
+                    const res = await fetch(UPDATE_CHECK_HELPER + '/apply-update', {
+                        method: 'POST', headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({}), cache: 'no-store'
+                    });
+                    const d = await res.json();
+                    if (d && d.ok) { updateCheckToast(d.message || ('已更新到 ' + (d.latest || '?') + '，请重启应用')); }
+                    else { updateCheckToast((d && d.error) || '更新失败'); }
+                } catch (e) { updateCheckToast('更新失败：' + (e && e.message ? e.message : e)); }
+                return;
+            }
+            // 第一击：查更新，有新版才进入确认态
+            try {
+                const res = await fetch(UPDATE_CHECK_HELPER + '/check-update', { cache: 'no-store' });
+                if (!res.ok) throw new Error('HTTP ' + res.status);
+                const d = await res.json();
+                if (!d || !d.ok) { updateCheckToast((d && d.error) || '检查失败'); return; }
+                if (!d.configured) { updateCheckToast('当前版本 ' + (d.current || '?') + ' · 还没配更新源'); return; }
+                if (!d.has_update) { updateCheckToast('已是最新（' + (d.current || '?') + '）'); return; }
+                btn.dataset.latest = d.latest || '?';
+                txt.textContent = updateUiText('确认更新 ' + btn.dataset.latest, 'Update to ' + btn.dataset.latest);
+                updateCheckToast('有新版本 ' + btn.dataset.latest + '，再点一次「确认更新」开始（自动留还原点）');
+                if (updateBtnArmTimer) clearTimeout(updateBtnArmTimer);
+                updateBtnArmTimer = setTimeout(resetUpdateBtn, 8000);
+            } catch (e) { updateCheckToast('检查失败：' + (e && e.message ? e.message : e)); }
         }
 
         // ---------- 检查软件更新（2026-09-28 从视频页顶栏搬进侧栏）：助手 /check-update，结果用 toast 报 ----------
@@ -2527,7 +2572,7 @@
                 const d = await res.json();
                 if (!d || !d.ok) { updateCheckToast((d && d.error) || '检查失败'); return; }
                 if (!d.configured) { updateCheckToast('当前版本 ' + (d.current || '?') + ' · 还没配更新源'); return; }
-                if (d.has_update) { updateCheckToast('有新版本 ' + (d.latest || '?') + '（当前 ' + (d.current || '?') + '）'); return; }
+                if (d.has_update) { updateCheckToast('有新版本 ' + (d.latest || '?') + '（当前 ' + (d.current || '?') + '）· 点左栏「一键更新」升级'); return; }
                 updateCheckToast('已是最新（' + (d.current || '?') + '）');
             } catch (e) { updateCheckToast('检查失败：' + (e && e.message ? e.message : String(e))); }
         }
