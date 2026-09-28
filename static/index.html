@@ -1602,7 +1602,7 @@
                     </button>
                 </div>
                 
-                <button id="update-now-btn" class="update-now-btn" onclick="runProjectUpdate()" type="button" title="一键更新">
+                <button id="update-now-btn" class="update-now-btn show" onclick="runProjectUpdate()" type="button" title="一键更新">
                     <svg fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                         <path d="M21 12a9 9 0 1 1-2.64-6.36"></path>
                         <path d="M21 3v6h-6"></path>
@@ -1673,6 +1673,30 @@
         </main>
     </div>
 
+    <!-- 更新确认弹窗（2026-09-29）：检查更新/一键更新发现新版本时直接弹「更新 / 取消」 -->
+    <div id="update-confirm-modal" class="studio-modal" hidden role="dialog" aria-modal="true" aria-labelledby="update-confirm-title">
+        <div class="studio-modal-panel" style="width:min(460px,100%)">
+            <div class="studio-modal-head">
+                <div>
+                    <div class="studio-modal-kicker">软件更新</div>
+                    <h2 id="update-confirm-title" class="studio-modal-title">发现新版本</h2>
+                </div>
+                <button class="studio-modal-close" type="button" onclick="closeUpdateConfirm()" title="取消" aria-label="取消">
+                    <svg fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                        <line x1="18" y1="6" x2="6" y2="18"></line>
+                        <line x1="6" y1="6" x2="18" y2="18"></line>
+                    </svg>
+                </button>
+            </div>
+            <div style="padding:18px 22px 20px">
+                <div id="update-confirm-text" style="font-size:13.5px; line-height:1.75"></div>
+                <div style="display:flex; justify-content:flex-end; gap:10px; margin-top:20px">
+                    <button type="button" onclick="closeUpdateConfirm()" style="padding:8px 18px; border-radius:999px; border:1px solid rgba(127,127,127,.4); background:none; color:inherit; font:inherit; font-size:13px; font-weight:700; cursor:pointer">取消</button>
+                    <button type="button" onclick="applyUpdateNow()" style="padding:8px 22px; border-radius:999px; border:1px solid #16a34a; background:#16a34a; color:#fff; font:inherit; font-size:13px; font-weight:800; cursor:pointer">立即更新</button>
+                </div>
+            </div>
+        </div>
+    </div>
     <div id="project-update-modal" class="studio-modal" hidden role="dialog" aria-modal="true" aria-labelledby="project-update-title">
         <div class="studio-modal-panel">
             <div class="studio-modal-head">
@@ -2486,54 +2510,52 @@
             if(event.key === 'Escape') closeProjectUpdateModal();
         });
 
-        // 一键更新（2026-09-28 改链路）：不再开原版更新弹窗 —— 那条路（/api/update-from-github）
-        // 硬编码拉原作者仓库 hero8152/Infinite-Canvas，会把定制页面全部冲回原版；
-        // 改走本机助手 /apply-update：从 update_source.json 配的自己的仓库下载并应用，
+        // 一键更新（2026-09-29 改弹窗流）：原版那套（/api/update-from-github 拉原作者仓库 +
+        // 「检测到更新才显示按钮」）弃用 —— 按钮改常驻，点击按钮或「检查更新」发现新版都直接弹
+        // 「更新 / 取消」确认框；确认后走本机助手 /apply-update：从自己的仓库下载并应用，
         // 只替换 main.py / VERSION / AI-Studio-Desktop.pyw / AI-Studio-Backend.py / static/**，
         // 更新前自动在 AI-Studio-Data\update_backups\ 留还原点，用户数据一律不碰。
-        // 交互用「两击确认」：第一击查版本，有新版才武装按钮（文案变「确认更新 vX」，8 秒不点自动复位）。
-        let updateBtnArmTimer = null;
-        function resetUpdateBtn() {
-            const btn = document.getElementById('update-now-btn');
-            const txt = document.getElementById('update-now-text');
-            if (btn) delete btn.dataset.latest;
-            if (txt) txt.textContent = updateUiText('一键更新', 'One-click Update');
-            if (updateBtnArmTimer) { clearTimeout(updateBtnArmTimer); updateBtnArmTimer = null; }
+        let updateConfirmLatest = "";
+        function openUpdateConfirm(latest, current) {
+            updateConfirmLatest = String(latest || "");
+            const box = document.getElementById('update-confirm-modal');
+            const txt = document.getElementById('update-confirm-text');
+            if (!box || !txt) return;
+            txt.textContent = '发现新版本 ' + updateConfirmLatest + '（当前 ' + (current || '?') +
+                '）。更新只替换程序文件，自动在 AI-Studio-Data\\update_backups\\ 留还原点，你的数据不受影响。现在就更新吗？';
+            box.hidden = false;
         }
-        async function runProjectUpdate() {
-            const btn = document.getElementById('update-now-btn');
-            const txt = document.getElementById('update-now-text');
-            if (!btn || !txt) return;
-            if (btn.dataset.latest) {                      // 已武装 → 第二击：真正执行
-                const latest = btn.dataset.latest;
-                resetUpdateBtn();
-                updateCheckToast('正在下载并应用更新…（约需几十秒，别关窗口）');
-                try {
-                    const res = await fetch(UPDATE_CHECK_HELPER + '/apply-update', {
-                        method: 'POST', headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({}), cache: 'no-store'
-                    });
-                    const d = await res.json();
-                    if (d && d.ok) { updateCheckToast(d.message || ('已更新到 ' + (d.latest || '?') + '，请重启应用')); }
-                    else { updateCheckToast((d && d.error) || '更新失败'); }
-                } catch (e) { updateCheckToast('更新失败：' + (e && e.message ? e.message : e)); }
-                return;
-            }
-            // 第一击：查更新，有新版才进入确认态
+        function closeUpdateConfirm() {
+            const box = document.getElementById('update-confirm-modal');
+            if (box) box.hidden = true;
+            updateConfirmLatest = "";
+        }
+        async function applyUpdateNow() {
+            closeUpdateConfirm();
+            updateCheckToast('正在下载并应用更新…（约需几十秒，别关窗口）');
+            try {
+                const res = await fetch(UPDATE_CHECK_HELPER + '/apply-update', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({}), cache: 'no-store'
+                });
+                const d = await res.json();
+                if (d && d.ok) { updateCheckToast(d.message || ('已更新到 ' + (d.latest || '?') + '，请重启应用')); }
+                else { updateCheckToast((d && d.error) || '更新失败'); }
+            } catch (e) { updateCheckToast('更新失败：' + (e && e.message ? e.message : e)); }
+        }
+        async function runProjectUpdate(silent) {
+            // silent=true：启动时的自动检查 —— 只有查到新版才弹窗，其余情况一律不出声
             try {
                 const res = await fetch(UPDATE_CHECK_HELPER + '/check-update', { cache: 'no-store' });
                 if (!res.ok) throw new Error('HTTP ' + res.status);
                 const d = await res.json();
-                if (!d || !d.ok) { updateCheckToast((d && d.error) || '检查失败'); return; }
-                if (!d.configured) { updateCheckToast('当前版本 ' + (d.current || '?') + ' · 还没配更新源'); return; }
-                if (!d.has_update) { updateCheckToast('已是最新（' + (d.current || '?') + '）'); return; }
-                btn.dataset.latest = d.latest || '?';
-                txt.textContent = updateUiText('确认更新 ' + btn.dataset.latest, 'Update to ' + btn.dataset.latest);
-                updateCheckToast('有新版本 ' + btn.dataset.latest + '，再点一次「确认更新」开始（自动留还原点）');
-                if (updateBtnArmTimer) clearTimeout(updateBtnArmTimer);
-                updateBtnArmTimer = setTimeout(resetUpdateBtn, 8000);
-            } catch (e) { updateCheckToast('检查失败：' + (e && e.message ? e.message : e)); }
+                if (!d || !d.ok) { if (!silent) updateCheckToast((d && d.error) || '检查失败'); return; }
+                if (!d.configured) { if (!silent) updateCheckToast('当前版本 ' + (d.current || '?') + ' · 还没配更新源'); return; }
+                if (d.has_update) { openUpdateConfirm(d.latest, d.current); return; }
+                if (!silent) updateCheckToast('已是最新（' + (d.current || '?') + '）');
+            } catch (e) { if (!silent) updateCheckToast('检查失败：' + (e && e.message ? e.message : e)); }
         }
+        setTimeout(function () { runProjectUpdate(true); }, 8000);   // 启动后 8 秒静默检查一次
 
         // ---------- 检查软件更新（2026-09-28 从视频页顶栏搬进侧栏）：助手 /check-update，结果用 toast 报 ----------
         // 更新源配置在 AI-Studio-Data\update_source.json 的 version_url（GitHub raw 的 VERSION 地址）；
@@ -2572,7 +2594,7 @@
                 const d = await res.json();
                 if (!d || !d.ok) { updateCheckToast((d && d.error) || '检查失败'); return; }
                 if (!d.configured) { updateCheckToast('当前版本 ' + (d.current || '?') + ' · 还没配更新源'); return; }
-                if (d.has_update) { updateCheckToast('有新版本 ' + (d.latest || '?') + '（当前 ' + (d.current || '?') + '）· 点左栏「一键更新」升级'); return; }
+                if (d.has_update) { openUpdateConfirm(d.latest, d.current); return; }
                 updateCheckToast('已是最新（' + (d.current || '?') + '）');
             } catch (e) { updateCheckToast('检查失败：' + (e && e.message ? e.message : String(e))); }
         }
