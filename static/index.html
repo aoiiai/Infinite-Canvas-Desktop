@@ -786,6 +786,17 @@
         .sidebar:hover .update-action-prefix { display:inline; }
         .sidebar:hover .update-now-text { max-width:130px; transition-delay:.15s; }
         .update-now-btn.show + .project-version-badge { display:none; }
+
+        /* 检查更新 pill 的「待更新」态（2026-09-29）：绿色 + 右上角小红点，文字变「一键更新」 */
+        #pillUpdate { position: relative; }
+        #pillUpdate .upd-dot {
+            position: absolute; top: -3px; right: -3px; width: 9px; height: 9px;
+            border-radius: 50%; background: #ef4444; display: none;
+            box-shadow: 0 0 0 2px rgba(239, 68, 68, .22);
+        }
+        #pillUpdate.pending .upd-dot { display: block; }
+        #pillUpdate.pending, #pillUpdate.pending .side-pill-text { color: #16a34a; }
+        #pillUpdate.pending svg { color: #16a34a; }
         html.theme-dark .update-now-btn,
         body.theme-dark .update-now-btn {
             border-color:rgba(134,239,172,.42);
@@ -1602,7 +1613,7 @@
                     </button>
                 </div>
                 
-                <button id="update-now-btn" class="update-now-btn show" onclick="runProjectUpdate()" type="button" title="一键更新">
+                <button id="update-now-btn" class="update-now-btn show" onclick="runProjectUpdate()" type="button" title="一键更新" style="display:none">
                     <svg fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                         <path d="M21 12a9 9 0 1 1-2.64-6.36"></path>
                         <path d="M21 3v6h-6"></path>
@@ -1628,13 +1639,15 @@
                         <span class="side-pill-text" data-i18n="common.darkMode">黑夜模式</span>
                     </button>
                     <!-- 检查更新（2026-09-28 从视频页顶栏搬来，用户指定放黑夜模式按钮下面）；
-                         逻辑 checkAppUpdate() 在下方主脚本里，结果用右上角 toast 报 -->
+                         2026-09-29 改弹窗流：发现新版直接弹「更新/取消」，取消后本按钮变绿色
+                         「一键更新」+ 小红点（此时点它 = 直接开始更新，见 checkAppUpdate/setPillPending） -->
                     <button class="side-pill" onclick="checkAppUpdate()" id="pillUpdate" type="button" title="检查软件更新（更新源写在 AI-Studio-Data\update_source.json 的 version_url）">
                         <svg fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                             <path d="M21 12a9 9 0 1 1-2.64-6.36"></path>
                             <path d="M21 3v6h-6"></path>
                         </svg>
                         <span class="side-pill-text">检查更新</span>
+                        <span class="upd-dot" aria-hidden="true"></span>
                     </button>
             </div>
 
@@ -2528,10 +2541,11 @@
         function closeUpdateConfirm() {
             const box = document.getElementById('update-confirm-modal');
             if (box) box.hidden = true;
-            updateConfirmLatest = "";
+            if (updateConfirmLatest) setPillPending(true);   // 用户取消 → pill 变绿色「一键更新」+ 红点
         }
         async function applyUpdateNow() {
-            closeUpdateConfirm();
+            const box = document.getElementById('update-confirm-modal');
+            if (box) box.hidden = true;
             updateCheckToast('正在下载并应用更新…（约需几十秒，别关窗口）');
             try {
                 const res = await fetch(UPDATE_CHECK_HELPER + '/apply-update', {
@@ -2539,8 +2553,13 @@
                     body: JSON.stringify({}), cache: 'no-store'
                 });
                 const d = await res.json();
-                if (d && d.ok) { updateCheckToast(d.message || ('已更新到 ' + (d.latest || '?') + '，请重启应用')); }
-                else { updateCheckToast((d && d.error) || '更新失败'); }
+                if (d && d.ok) {
+                    setPillPending(false);          // 更新成功：恢复成「检查更新」常态
+                    updateConfirmLatest = "";
+                    updateCheckToast(d.message || ('已更新到 ' + (d.latest || '?') + '，请重启应用'));
+                } else {
+                    updateCheckToast((d && d.error) || '更新失败');   // 失败：保持绿色一键更新，可再点重试
+                }
             } catch (e) { updateCheckToast('更新失败：' + (e && e.message ? e.message : e)); }
         }
         async function runProjectUpdate(silent) {
@@ -2579,7 +2598,19 @@
             if (updateCheckToastTimer) clearTimeout(updateCheckToastTimer);
             updateCheckToastTimer = setTimeout(function () { t.style.opacity = '0'; }, 3500);
         }
+        function setPillPending(on) {
+            // 检查更新 pill 的两态：常态「检查更新」；有待更新时绿色「一键更新」+ 红点（此时点它直接更新）
+            const pill = document.getElementById('pillUpdate');
+            if (!pill) return;
+            pill.classList.toggle('pending', !!on);
+            const txt = pill.querySelector('.side-pill-text');
+            if (txt) txt.textContent = on ? '一键更新' : '检查更新';
+            pill.title = on ? '一键更新：立即下载并应用已发现的新版本'
+                            : '检查软件更新（更新源写在 AI-Studio-Data\\update_source.json 的 version_url）';
+        }
         async function checkAppUpdate() {
+            const pill = document.getElementById('pillUpdate');
+            if (pill && pill.classList.contains('pending')) { applyUpdateNow(); return; }   // 待更新态：一键直更
             async function helperAlive() {
                 try {
                     const r = await fetch(UPDATE_CHECK_HELPER + '/health', { cache: 'no-store' });
