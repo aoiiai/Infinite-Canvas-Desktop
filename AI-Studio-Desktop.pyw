@@ -3199,75 +3199,6 @@ def _update_file_allowed(rel: str) -> bool:
     return rel in _UPDATE_ALLOWED_ROOT_FILES or rel.startswith("static/")
 
 
-def _update_files_via_cdn(owner: str, repo: str, branch: str, staging: str) -> int:
-    """兜底路线（2026-09-29 实测）：codeload 对受限网络 QoS 限速到 ~45KB/s（14MB 要 5 分多钟），
-    而 api.github.com 和 cdn.jsdelivr.net 都快 → 用 api 拿文件清单、CDN 逐文件下载。
-    ⚠ 受限网络对什么都会间歇性 RST（10054），每个请求必须自带重试，否则 157 个文件
-    只要断一个就全盘失败。返回下载文件数；失败抛异常（此时 staging 已脏，由调用方清理）。"""
-    import urllib.request as _ur
-
-    def _fetch_to(url: str, target: str, timeout: int, tries: int = 3) -> None:
-        last = None
-        for k in range(tries):
-            try:
-                if _CURL_EXE:
-                    _curl_fetch(url, target, timeout, retries=1)
-                else:
-                    import urllib.request as _ur
-                    req = _ur.Request(url, headers={"User-Agent": "AI-Studio-Desktop"})
-                    with _ur.urlopen(req, timeout=timeout) as resp, open(target, "wb") as out:
-                        shutil.copyfileobj(resp, out, 256 * 1024)
-                return
-            except Exception as exc:
-                last = exc
-                time.sleep(2 * (k + 1))
-        raise RuntimeError("%s → %s" % (url.split("/")[2], last))
-
-    tree_url = "https://api.github.com/repos/%s/%s/git/trees/%s?recursive=1" % (owner, repo, branch)
-    tmp = os.path.join(staging, "_tree.json")
-    _fetch_to(tree_url, tmp, 30)
-    with open(tmp, "r", encoding="utf-8") as fh:
-        data = json.load(fh)
-    os.remove(tmp)
-    if data.get("truncated"):
-        raise RuntimeError("仓库文件清单被截断")
-    blobs = [e for e in (data.get("tree") or [])
-             if e.get("type") == "blob" and _update_file_allowed(str(e.get("path")))]
-    if not blobs:
-        raise RuntimeError("文件清单里没有可更新的文件")
-    total = 0
-    done = 0
-    # jsDelivr 三域名轮换：受限网络会间歇性 RST（实测 ~1/3），换 SNI 域名常能绕开
-    cdn_hosts = ("cdn.jsdelivr.net", "fastly.jsdelivr.net", "gcore.jsdelivr.net")
-    for e in blobs:
-        rel = str(e["path"]).replace("\\", "/")
-        size = int(e.get("size") or 0)
-        total += size
-        if size > 100 * 1024 * 1024 or total > _UPDATE_ZIP_MAX:
-            raise RuntimeError("更新内容超限（%s）" % rel)
-        raw = "https://cdn.jsdelivr.net/gh/%s/%s@%s/%s" % (owner, repo, branch, rel)
-        target = os.path.join(staging, *rel.split("/"))
-        os.makedirs(os.path.dirname(target), exist_ok=True)
-        last = None
-        for k in range(6):
-            try:
-                _fetch_to(raw.replace("cdn.jsdelivr.net", cdn_hosts[k % len(cdn_hosts)], 1),
-                          target, 60, 1)
-                last = None
-                break
-            except Exception as exc:
-                last = exc
-                time.sleep(1 + k)
-        if last is not None:
-            raise RuntimeError("文件 %s：%s" % (rel, last))
-        if os.path.getsize(target) != size:
-            raise RuntimeError("文件下载不完整：%s" % rel)
-        done += 1
-        if done % 20 == 0:
-            time.sleep(0.5)      # 别太猛，避免触发 CDN 限流
-    return len(blobs)
-
-
 def apply_update(force: bool = False) -> dict:
     cur = _read_project_version()
     url = ""
@@ -3293,69 +3224,115 @@ def apply_update(force: bool = False) -> dict:
         os.makedirs(staging, exist_ok=True)
 
     _reset_staging()
-    # 1) zip 路线（codeload → api zipball 兜底）：流式落盘 + 总量上限 + 每次尝试 45 秒墙钟预算。
-    #    ⚠ 慢滴连接永远不会触发 socket 超时（实测 codeload ~45KB/s，45KB < 90s 的每次 read），
-    #    必须按墙钟主动放弃换路线，否则一次更新挂五分钟。
-    last_err = ""
-    zip_ok = False
-    for zip_url in zip_urls:
-        try:
-            zip_target = os.path.join(staging, "repo.zip")
-            if _CURL_EXE:
-                _curl_fetch(zip_url, zip_target, 45, retries=1)   # 45s：慢滴直接放弃换路线
-            else:
-                t0 = time.time()
-                req = _ur.Request(zip_url, headers={"User-Agent": "AI-Studio-Desktop"})
-                with _ur.urlopen(req, timeout=30) as resp, open(zip_target, "wb") as out:
-                    total = 0
-                    while True:
-                        if time.time() - t0 > 45:
-                            raise RuntimeError("下载超 45 秒未完成（zip 源被限速），换下一条路线")
-                        chunk = resp.read(256 * 1024)
-                        if not chunk:
-                            break
-                        total += len(chunk)
-                        if total > _UPDATE_ZIP_MAX:
-                            raise RuntimeError("更新包超过 %d MB，已中止" % (_UPDATE_ZIP_MAX // 1024 // 1024))
-                        out.write(chunk)
-        except Exception as exc:
-            last_err = "zip 下载失败（%s）：%s" % (zip_url.split("/")[2], exc)
-            _reset_staging()
-            continue
-        try:
-            with _zf.ZipFile(os.path.join(staging, "repo.zip")) as zf:
-                names = zf.namelist()
-                if not names or len(names) > _UPDATE_ENTRIES_MAX:
-                    raise RuntimeError("更新包含 %d 个条目，超出保护上限" % len(names))
-                top = names[0].split("/")[0]
-                for info in zf.infolist():
-                    rel = info.filename.replace("\\", "/")
-                    if rel.startswith(top + "/"):
-                        rel = rel[len(top) + 1:]
-                    if not rel or rel.endswith("/"):
-                        continue
-                    if rel.lstrip("/").startswith("/") or ".." in rel.split("/"):
-                        raise RuntimeError("更新包含可疑路径，已中止")
-                    if not _update_file_allowed(rel):
-                        continue
-                    target = os.path.join(staging, *rel.split("/"))
-                    os.makedirs(os.path.dirname(target), exist_ok=True)
-                    with zf.open(info) as src, open(target, "wb") as dst:
-                        shutil.copyfileobj(src, dst, 256 * 1024)
-            zip_ok = True
-            break
-        except Exception as exc:
-            last_err = "解压失败：%s" % exc
-            _reset_staging()
-    # 2) 兜底路线：api.github.com 拿文件清单 + cdn.jsdelivr.net 逐文件下载（两条 zip 路线都败时）
-    via = "zip"
-    if not zip_ok:
-        try:
-            n = _update_files_via_cdn(owner, repo, branch, staging)
-            via = "CDN逐文件（%d 个文件）" % n
-        except Exception as exc:
+    latest = ""
+    via = ""
+    staged = False
+    release_err = ""
+    # —— 路线 A（首选）：GitHub Release 资产。tag 不可变（永无陈旧缓存）、不走 codeload、
+    #    实测匿名下载 3/3 成功（2.9MB，1.5~30 秒）。资产 = update.zip（git archive 平铺白名单文件）。
+    try:
+        meta_t = os.path.join(staging, "_meta.json")
+        _curl_fetch("https://api.github.com/repos/%s/%s/releases/latest" % (owner, repo),
+                    meta_t, 20, retries=2)
+        with open(meta_t, "r", encoding="utf-8") as fh:
+            meta = json.load(fh)
+        os.remove(meta_t)
+        tag = str(meta.get("tag_name") or "").strip()
+        asset_url = ""
+        for a in (meta.get("assets") or []):
+            if str(a.get("name") or "") == "update.zip":
+                asset_url = str(a.get("browser_download_url") or "")
+        if not tag or not asset_url:
+            raise RuntimeError("release 缺 tag 或 update.zip 资产")
+        latest = tag.lstrip("vV")
+        if not force and not _ver_newer(latest, cur):
             shutil.rmtree(staging, ignore_errors=True)
-            return {"ok": False, "error": (last_err or "下载失败") + "；CDN 兜底也失败：" + str(exc)}
+            return {"ok": False, "current": cur, "latest": latest,
+                    "error": "已是最新（%s），无需更新" % (cur or "?")}
+        _curl_fetch(asset_url, os.path.join(staging, "update.zip"), 300, retries=3)
+        with _zf.ZipFile(os.path.join(staging, "update.zip")) as zf:
+            names = zf.namelist()
+            if not names or len(names) > _UPDATE_ENTRIES_MAX:
+                raise RuntimeError("更新包含 %d 个条目，超出保护上限" % len(names))
+            for info in zf.infolist():
+                rel = info.filename.replace("\\", "/")
+                if not rel or rel.endswith("/"):
+                    continue
+                if rel.lstrip("/").startswith("/") or ".." in rel.split("/"):
+                    raise RuntimeError("更新包含可疑路径，已中止")
+                if not _update_file_allowed(rel):
+                    continue
+                target = os.path.join(staging, *rel.split("/"))
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                with zf.open(info) as src, open(target, "wb") as dst:
+                    shutil.copyfileobj(src, dst, 256 * 1024)
+        os.remove(os.path.join(staging, "update.zip"))
+        via = "Release资产"
+        staged = True
+    except Exception as exc:
+        release_err = str(exc)
+        _reset_staging()
+    # —— 路线 B（兜底）：仓库 zip（codeload → api zipball，每次 45 秒墙钟预算）。
+    #    ⚠ 慢滴连接永远不会触发 socket 超时（实测 codeload ~45KB/s），必须按墙钟放弃换路线；
+    #    ⚠ codeload 归档有分钟级缓存，强推后立刻拉可能拿到旧树 —— 所以只是兜底不是首选。
+    if not staged:
+        last_err = ""
+        zip_ok = False
+        for zip_url in zip_urls:
+            try:
+                zip_target = os.path.join(staging, "repo.zip")
+                if _CURL_EXE:
+                    _curl_fetch(zip_url, zip_target, 45, retries=1)   # 45s：慢滴直接放弃换路线
+                else:
+                    t0 = time.time()
+                    req = _ur.Request(zip_url, headers={"User-Agent": "AI-Studio-Desktop"})
+                    with _ur.urlopen(req, timeout=30) as resp, open(zip_target, "wb") as out:
+                        total = 0
+                        while True:
+                            if time.time() - t0 > 45:
+                                raise RuntimeError("下载超 45 秒未完成（zip 源被限速），换下一条路线")
+                            chunk = resp.read(256 * 1024)
+                            if not chunk:
+                                break
+                            total += len(chunk)
+                            if total > _UPDATE_ZIP_MAX:
+                                raise RuntimeError("更新包超过 %d MB，已中止" % (_UPDATE_ZIP_MAX // 1024 // 1024))
+                            out.write(chunk)
+            except Exception as exc:
+                last_err = "zip 下载失败（%s）：%s" % (zip_url.split("/")[2], exc)
+                _reset_staging()
+                continue
+            try:
+                with _zf.ZipFile(os.path.join(staging, "repo.zip")) as zf:
+                    names = zf.namelist()
+                    if not names or len(names) > _UPDATE_ENTRIES_MAX:
+                        raise RuntimeError("更新包含 %d 个条目，超出保护上限" % len(names))
+                    top = names[0].split("/")[0]
+                    for info in zf.infolist():
+                        rel = info.filename.replace("\\", "/")
+                        if rel.startswith(top + "/"):
+                            rel = rel[len(top) + 1:]
+                        if not rel or rel.endswith("/"):
+                            continue
+                        if rel.lstrip("/").startswith("/") or ".." in rel.split("/"):
+                            raise RuntimeError("更新包含可疑路径，已中止")
+                        if not _update_file_allowed(rel):
+                            continue
+                        target = os.path.join(staging, *rel.split("/"))
+                        os.makedirs(os.path.dirname(target), exist_ok=True)
+                        with zf.open(info) as src, open(target, "wb") as dst:
+                            shutil.copyfileobj(src, dst, 256 * 1024)
+                zip_ok = True
+                via = "zip"
+                staged = True
+                break
+            except Exception as exc:
+                last_err = "解压失败：%s" % exc
+                _reset_staging()
+        if not staged:
+            shutil.rmtree(staging, ignore_errors=True)
+            return {"ok": False,
+                    "error": "Release 路线失败（%s）；%s" % (release_err or "无 release", last_err or "未知")}
     # 3) 校验 staging：VERSION 必须在、static/ 必须非空
     try:
         with open(os.path.join(staging, "VERSION"), "r", encoding="utf-8") as fh:
