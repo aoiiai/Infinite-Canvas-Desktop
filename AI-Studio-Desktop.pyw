@@ -3147,25 +3147,60 @@ _UPDATE_BACKUP_KEEP = 10                 # 还原点保留个数（与 main.py �
 
 
 def _update_repo_from_url(url: str):
-    """从 VERSION 地址解析出仓库标识与 zip 下载源列表；解析不出返回 ('', [])。
+    """从 VERSION 地址解析出 (仓库标识, zip候选源列表, (owner, repo, branch))；解析不出返回 ('', [], None)。
     支持两种写法（2026-09-28 实测本机网络：raw.githubusercontent.com 被墙连不上，
     jsDelivr / codeload / api.github.com 都通）：raw 的 VERSION 地址、jsDelivr 的 VERSION 地址。
-    下载源给两个候选（codeload 失败自动换 api zipball），适配不同用户的网络。"""
+    zip 候选源两个（codeload 失败换 api zipball），适配不同用户的网络。"""
     u = str(url or "").strip()
     m = re.match(r"^https?://raw\.githubusercontent\.com/([^/]+)/([^/]+)/([^/]+)/VERSION/?$", u)
     if not m:
         m = re.match(r"^https?://cdn\.jsdelivr\.net/gh/([^/@]+)/([^/@]+)@([^/@]+)/VERSION/?$", u)
     if not m:
-        return "", []
+        return "", [], None
     owner, repo, branch = m.group(1), m.group(2), m.group(3)
     return ("%s/%s@%s" % (owner, repo, branch),
             ["https://codeload.github.com/%s/%s/zip/refs/heads/%s" % (owner, repo, branch),
-             "https://api.github.com/repos/%s/%s/zipball/%s" % (owner, repo, branch)])
+             "https://api.github.com/repos/%s/%s/zipball/%s" % (owner, repo, branch)],
+            (owner, repo, branch))
 
 
 def _update_file_allowed(rel: str) -> bool:
     rel = str(rel or "").replace("\\", "/").lstrip("/")
     return rel in _UPDATE_ALLOWED_ROOT_FILES or rel.startswith("static/")
+
+
+def _update_files_via_cdn(owner: str, repo: str, branch: str, staging: str) -> int:
+    """兜底路线（2026-09-29 实测）：codeload 对受限网络 QoS 限速到 ~45KB/s（14MB 要 5 分多钟），
+    而 api.github.com 和 cdn.jsdelivr.net 都秒开 → 用 api 拿文件清单、CDN 逐文件下载。
+    返回下载文件数；失败抛异常（此时 staging 已脏，由调用方清理）。"""
+    import urllib.request as _ur
+    tree_url = "https://api.github.com/repos/%s/%s/git/trees/%s?recursive=1" % (owner, repo, branch)
+    req = _ur.Request(tree_url, headers={"User-Agent": "AI-Studio-Desktop",
+                                         "Accept": "application/vnd.github+json"})
+    with _ur.urlopen(req, timeout=30) as resp:
+        data = json.loads(resp.read(20 * 1024 * 1024).decode("utf-8"))
+    if data.get("truncated"):
+        raise RuntimeError("仓库文件清单被截断")
+    blobs = [e for e in (data.get("tree") or [])
+             if e.get("type") == "blob" and _update_file_allowed(str(e.get("path")))]
+    if not blobs:
+        raise RuntimeError("文件清单里没有可更新的文件")
+    total = 0
+    for e in blobs:
+        rel = str(e["path"]).replace("\\", "/")
+        size = int(e.get("size") or 0)
+        total += size
+        if size > 100 * 1024 * 1024 or total > _UPDATE_ZIP_MAX:
+            raise RuntimeError("更新内容超限（%s）" % rel)
+        raw = "https://cdn.jsdelivr.net/gh/%s/%s@%s/%s" % (owner, repo, branch, rel)
+        target = os.path.join(staging, *rel.split("/"))
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        req2 = _ur.Request(raw, headers={"User-Agent": "AI-Studio-Desktop"})
+        with _ur.urlopen(req2, timeout=60) as resp2, open(target, "wb") as out:
+            shutil.copyfileobj(resp2, out, 256 * 1024)
+        if os.path.getsize(target) != size:
+            raise RuntimeError("文件下载不完整：%s" % rel)
+    return len(blobs)
 
 
 def apply_update(force: bool = False) -> dict:
@@ -3180,22 +3215,33 @@ def apply_update(force: bool = False) -> dict:
         pass
     if not url:
         return {"ok": False, "error": "还没配更新源（AI-Studio-Data\\update_source.json 的 version_url）"}
-    repo_id, zip_urls = _update_repo_from_url(url)
+    repo_id, zip_urls, repo_tuple = _update_repo_from_url(url)
     if not repo_id:
         return {"ok": False, "error": "version_url 解析不出 GitHub 仓库（支持 raw / jsDelivr 的 VERSION 地址）"}
+    owner, repo, branch = repo_tuple
     import urllib.request as _ur
     import zipfile as _zf
     staging = os.path.join(state_dir(), "update_staging")
-    shutil.rmtree(staging, ignore_errors=True)
-    os.makedirs(staging, exist_ok=True)
-    # 1) 下载仓库 zip（流式落盘 + 总量上限；候选源按顺序试，codeload 失败换 api zipball）
-    err = ""
+
+    def _reset_staging():
+        shutil.rmtree(staging, ignore_errors=True)
+        os.makedirs(staging, exist_ok=True)
+
+    _reset_staging()
+    # 1) zip 路线（codeload → api zipball 兜底）：流式落盘 + 总量上限 + 每次尝试 45 秒墙钟预算。
+    #    ⚠ 慢滴连接永远不会触发 socket 超时（实测 codeload ~45KB/s，45KB < 90s 的每次 read），
+    #    必须按墙钟主动放弃换路线，否则一次更新挂五分钟。
+    last_err = ""
+    zip_ok = False
     for zip_url in zip_urls:
         try:
+            t0 = time.time()
             req = _ur.Request(zip_url, headers={"User-Agent": "AI-Studio-Desktop"})
-            with _ur.urlopen(req, timeout=90) as resp, open(os.path.join(staging, "repo.zip"), "wb") as out:
+            with _ur.urlopen(req, timeout=30) as resp, open(os.path.join(staging, "repo.zip"), "wb") as out:
                 total = 0
                 while True:
+                    if time.time() - t0 > 45:
+                        raise RuntimeError("下载超 45 秒未完成（zip 源被限速），换下一条路线")
                     chunk = resp.read(256 * 1024)
                     if not chunk:
                         break
@@ -3203,37 +3249,44 @@ def apply_update(force: bool = False) -> dict:
                     if total > _UPDATE_ZIP_MAX:
                         raise RuntimeError("更新包超过 %d MB，已中止" % (_UPDATE_ZIP_MAX // 1024 // 1024))
                     out.write(chunk)
-            err = ""
+        except Exception as exc:
+            last_err = "zip 下载失败（%s）：%s" % (zip_url.split("/")[2], exc)
+            _reset_staging()
+            continue
+        try:
+            with _zf.ZipFile(os.path.join(staging, "repo.zip")) as zf:
+                names = zf.namelist()
+                if not names or len(names) > _UPDATE_ENTRIES_MAX:
+                    raise RuntimeError("更新包含 %d 个条目，超出保护上限" % len(names))
+                top = names[0].split("/")[0]
+                for info in zf.infolist():
+                    rel = info.filename.replace("\\", "/")
+                    if rel.startswith(top + "/"):
+                        rel = rel[len(top) + 1:]
+                    if not rel or rel.endswith("/"):
+                        continue
+                    if rel.lstrip("/").startswith("/") or ".." in rel.split("/"):
+                        raise RuntimeError("更新包含可疑路径，已中止")
+                    if not _update_file_allowed(rel):
+                        continue
+                    target = os.path.join(staging, *rel.split("/"))
+                    os.makedirs(os.path.dirname(target), exist_ok=True)
+                    with zf.open(info) as src, open(target, "wb") as dst:
+                        shutil.copyfileobj(src, dst, 256 * 1024)
+            zip_ok = True
             break
         except Exception as exc:
-            err = "下载失败（%s）：%s" % (zip_url.split("/")[2], exc)
-    if err:
-        shutil.rmtree(staging, ignore_errors=True)
-        return {"ok": False, "error": err}
-    # 2) 解压白名单文件（剥掉仓库根目录一层；路径穿越保护）
-    try:
-        with _zf.ZipFile(os.path.join(staging, "repo.zip")) as zf:
-            names = zf.namelist()
-            if not names or len(names) > _UPDATE_ENTRIES_MAX:
-                raise RuntimeError("更新包含 %d 个条目，超出保护上限" % len(names))
-            top = names[0].split("/")[0]
-            for info in zf.infolist():
-                rel = info.filename.replace("\\", "/")
-                if rel.startswith(top + "/"):
-                    rel = rel[len(top) + 1:]
-                if not rel or rel.endswith("/"):
-                    continue
-                if rel.lstrip("/").startswith("/") or ".." in rel.split("/"):
-                    raise RuntimeError("更新包含可疑路径，已中止")
-                if not _update_file_allowed(rel):
-                    continue
-                target = os.path.join(staging, *rel.split("/"))
-                os.makedirs(os.path.dirname(target), exist_ok=True)
-                with zf.open(info) as src, open(target, "wb") as dst:
-                    shutil.copyfileobj(src, dst, 256 * 1024)
-    except Exception as exc:
-        shutil.rmtree(staging, ignore_errors=True)
-        return {"ok": False, "error": "解压失败：%s" % exc}
+            last_err = "解压失败：%s" % exc
+            _reset_staging()
+    # 2) 兜底路线：api.github.com 拿文件清单 + cdn.jsdelivr.net 逐文件下载（两条 zip 路线都败时）
+    via = "zip"
+    if not zip_ok:
+        try:
+            n = _update_files_via_cdn(owner, repo, branch, staging)
+            via = "CDN逐文件（%d 个文件）" % n
+        except Exception as exc:
+            shutil.rmtree(staging, ignore_errors=True)
+            return {"ok": False, "error": (last_err or "下载失败") + "；CDN 兜底也失败：" + str(exc)}
     # 3) 校验 staging：VERSION 必须在、static/ 必须非空
     try:
         with open(os.path.join(staging, "VERSION"), "r", encoding="utf-8") as fh:
@@ -3296,7 +3349,7 @@ def apply_update(force: bool = False) -> dict:
         shutil.rmtree(staging, ignore_errors=True)
         return {"ok": False, "error": "应用更新失败，已回滚到还原点：%s" % exc}
     shutil.rmtree(staging, ignore_errors=True)
-    return {"ok": True, "repo": repo_id, "current": cur, "latest": latest,
+    return {"ok": True, "repo": repo_id, "current": cur, "latest": latest, "via": via,
             "updated": updated, "backup": os.path.basename(backup_dir),
             "restart_required": True, "message": "已更新到 %s，请重启应用" % latest}
 
