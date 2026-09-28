@@ -1,0 +1,30 @@
+# ==== 运行时 / 用户数据（不进仓库：更新与重装都不碰这些）====
+python/
+AI-Studio-Data/
+data/
+output/
+assets/
+history.json
+__pycache__/
+*.py[cod]
+
+# ==== 日志 / 临时 / 备份 ====
+*.log
+*.bak
+*.update_tmp
+update_staging/
+_self_restart.bat
+_self_restart.log
+_tmp_*.py
+
+# ==== 内部开发文档与 AI 会话记忆（仅本地开发用）====
+.workbuddy-ai/
+AI-交接说明.md
+AI-操作指南.md
+AI-开工必读.md
+
+# ==== 开发期手工备份（不入库）====
+*.broken-before-*
+*.mojibake-backup
+*.stable-before-*
+static/js/i18n(1)/

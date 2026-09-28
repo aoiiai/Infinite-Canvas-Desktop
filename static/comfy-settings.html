@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ComfyUI 设置</title>
+    <script>
+        (function () {
+            try {
+                var theme = localStorage.getItem('studio_theme') || localStorage.getItem('canvas_theme') || 'light';
+                if (theme === 'dark') {
+                    document.documentElement.classList.add('studio-theme-dark');
+                    document.documentElement.classList.add('theme-dark');
+                }
+            } catch (e) { }
+        })();
+    </script>
+    <style>
+        /* 颜色变量跟应用其它页保持一致，深色模式由 html.studio-theme-dark 切换 */
+        :root { --bg:#f7f8fa; --panel:#fff; --soft:#f1f4f8; --line:#e8ecf2; --line-strong:#dbe1ea;
+                --text:#0f172a; --muted:#64748b; --faint:#94a3b8; }
+        html.studio-theme-dark { --bg:#0e1014; --panel:#1c1e26; --soft:#272a33; --line:#323540;
+                --line-strong:#3f424d; --text:#e8e8ea; --muted:#a4adbf; --faint:#7a8497; }
+        * { box-sizing: border-box; }
+        body { margin:0; min-height:100vh; background:var(--bg); color:var(--text);
+               font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+               -webkit-font-smoothing:antialiased; }
+        .page { min-height:100vh; padding:32px 24px 80px; }
+        .wrap { max-width:1080px; margin:0 auto; }
+        .page-head { padding:0 4px 24px; display:flex; justify-content:space-between;
+                     align-items:end; gap:24px; flex-wrap:wrap; }
+        .title { font-size:26px; line-height:1.05; font-weight:900; letter-spacing:-.015em; }
+        .sub { margin-top:8px; color:var(--muted); font-size:12.5px; line-height:1.55;
+               font-weight:600; max-width:560px; }
+        .head-status { color:var(--muted); font-size:11.5px; font-weight:700; letter-spacing:.04em;
+                       text-transform:uppercase; min-height:16px; text-align:right; }
+        .cols { display:flex; flex-direction:column; gap:16px; }
+        .card { padding:16px; background:var(--panel); border:1px solid var(--line);
+                border-radius:14px; display:flex; flex-direction:column; gap:10px; }
+        .card-title { color:var(--faint); font-size:10px; font-weight:900; letter-spacing:.1em;
+                      text-transform:uppercase; padding:0 2px; }
+        input[type=text] { width:100%; height:36px; padding:0 10px; background:var(--panel);
+                           border:1px solid var(--line-strong); border-radius:10px; color:var(--text);
+                           font:inherit; font-size:12.5px; outline:none; cursor:pointer; }
+        input[type=text]:hover { border-color:var(--faint); }
+        .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+        button { height:34px; padding:0 12px; border-radius:10px; cursor:pointer;
+                 border:1px solid var(--line-strong); background:var(--panel); color:var(--muted);
+                 font:inherit; font-size:11.5px; font-weight:800; transition:all .15s ease; }
+        button:hover { color:var(--text); border-color:var(--faint); background:var(--soft); }
+        button:disabled { opacity:.5; cursor:default; }
+        button.primary { background:var(--text); border-color:var(--text); color:var(--panel); }
+        button.primary:hover { opacity:.85; background:var(--text); color:var(--panel); }
+        .check { display:flex; align-items:center; gap:6px; font-size:11.5px; font-weight:700;
+                 color:var(--muted); cursor:pointer; }
+        .status-line { font-size:12px; line-height:1.6; font-weight:600; color:var(--muted); }
+        .status-line b { color:var(--text); font-weight:800; }
+        .warn { color:#b45309; } .bad { color:#b91c1c; } .ok { color:#15803d; }
+        html.studio-theme-dark .warn { color:#fbbf24; }
+        html.studio-theme-dark .bad { color:#fca5a5; }
+        html.studio-theme-dark .ok { color:#4ade80; }
+        .tip { font-size:11px; font-weight:600; color:var(--faint); line-height:1.6; }
+        .tip code, .kv code { font-family:ui-monospace,Menlo,monospace; font-size:11px; word-break:break-all; }
+        .kv { display:grid; grid-template-columns:112px minmax(0,1fr); gap:6px 12px;
+              font-size:12px; font-weight:600; color:var(--muted); }
+        .kv b { color:var(--text); font-weight:800; }
+        .missing { margin:0 0 0 2px; padding-left:16px; font-size:11.5px; line-height:1.7; color:var(--muted); }
+        .missing code { font-family:ui-monospace,Menlo,monospace; font-size:11px; }
+        .wf { font-size:12px; font-weight:800; margin-top:8px; color:var(--text); }
+    </style>
+</head>
+<body>
+    <div class="page">
+        <div class="wrap">
+            <header class="page-head">
+                <div>
+                    <div class="title">ComfyUI 设置</div>
+                    <div class="sub">指定 ComfyUI 的安装目录。填好之后，LoRA 库直接扫它的 models/loras，
+                        参考图直接写进它的 input 目录，生成前还能核对工作流要的模型在不在。</div>
+                </div>
+                <div id="cpHead" class="head-status"></div>
+            </header>
+
+            <div class="cols">
+                <section class="card">
+                    <div class="card-title">安装路径</div>
+                    <input id="cpuPath" type="text" spellcheck="false" autocomplete="off" readonly
+                           title="点一下选文件夹（也可以按「浏览…」）" placeholder="点这里选文件夹…">
+                    <div class="row">
+                        <button id="cpuBrowse" type="button">浏览…</button>
+                        <button id="cpuSave" class="primary" type="button">保存</button>
+                        <button id="cpuLaunch" type="button">启动 ComfyUI</button>
+                        <button id="cpuCheck" type="button">检查模型</button>
+                    </div>
+                    <label class="check"><input id="cpuAuto" type="checkbox"> 启动桌面版时自动拉起 ComfyUI</label>
+                    <div class="row" style="align-items:center; margin-top:10px">
+                        <span style="font-size:13px; font-weight:700; color:inherit">Civitai 链接域名</span>
+                        <label class="check" style="margin:0"><input type="radio" name="civDomain" value="civitai.red"> civitai.red</label>
+                        <label class="check" style="margin:0"><input type="radio" name="civDomain" value="civitai.com"> civitai.com</label>
+                    </div>
+                    <div id="cpuStatus" class="status-line">读取中…</div>
+                    <div id="cpuDetail"></div>
+                    <div class="tip">路径要选到 ComfyUI 的根目录（里面有 main.py 和 models 文件夹）。
+                        「启动 ComfyUI」会用它的 run_nvidia_gpu.bat 之类的启动脚本，在一个新窗口里跑，
+                        这样它的日志你能看到。</div>
+                </section>
+
+                <section class="card">
+                    <div class="card-title">当前生效</div>
+                    <div id="cpInfo" class="kv"><span>读取中…</span></div>
+                </section>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        (function () {
+            'use strict';
+            var HELPER = 'http://127.0.0.1:8317';
+            var busy = false;
+            var startedAt = 0;
+
+            function $(id) { return document.getElementById(id); }
+
+            function hj(path, options) {
+                return fetch(HELPER + path, options).then(function (r) {
+                    return r.json().catch(function () { return {}; }).then(function (d) {
+                        if (!r.ok) {
+                            throw new Error((d && (d.message || d.error)) || ('HTTP ' + r.status));
+                        }
+                        return d;
+                    });
+                });
+            }
+
+            function esc(s) {
+                return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+                    return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+                });
+            }
+
+            function setStatus(html, cls) {
+                var el = $('cpuStatus');
+                if (!el) return;
+                el.className = 'status-line' + (cls ? ' ' + cls : '');
+                el.innerHTML = html;
+            }
+
+            function render(rep) {
+                if (!rep) {
+                    setStatus('连不上本地助手服务。桌面版才有这个服务，网页版用不了这几项。', 'bad');
+                    $('cpHead').textContent = '助手未运行';
+                    return;
+                }
+                var head = [];
+                if (!rep.configured) head.push('<span class="warn">未设置路径</span>');
+                else if (!rep.exists) head.push('<span class="bad">路径不存在</span>');
+                else head.push('<span class="ok">已设置</span>');
+                head.push(rep.running ? '<span class="ok">ComfyUI 运行中</span>'
+                                      : '<span class="warn">ComfyUI 未运行</span>');
+                $('cpHead').innerHTML = head.join('　·　');
+
+                var bits = [];
+                if (!rep.configured) {
+                    bits.push('<b>还没填路径</b>');
+                } else if (!rep.exists) {
+                    bits.push('<span class="bad">目录不存在</span>');
+                } else {
+                    var ok = [];
+                    ok.push('LoRA <b>' + rep.loras + '</b> 个');
+                    ok.push('模型 <b>' + rep.models + '</b> 个');
+                    if (rep.main_py) ok.push('main.py <b>✓</b>');
+                    if (rep.run_bat) ok.push(esc(rep.run_bat));
+                    bits.push(ok.join(' · '));
+                }
+                bits.push('后端 <b>' + esc(rep.address || '?') + '</b> ' +
+                    (rep.running ? '<span class="ok">运行中</span>' : '<span class="warn">未运行</span>'));
+                if (rep.problems && rep.problems.length) {
+                    bits.push('<span class="warn">' + esc(rep.problems[0]) + '</span>');
+                }
+                setStatus(bits.join('　·　'), rep.running ? '' : 'warn');
+
+                var pathEl = $('cpuPath');
+                if (pathEl && document.activeElement !== pathEl) pathEl.value = rep.install_dir || '';
+                $('cpuAuto').checked = !!rep.auto_start;
+                var dom = (rep.civitai_domain || 'civitai.red');
+                var radios = document.querySelectorAll('input[name="civDomain"]');
+                for (var i = 0; i < radios.length; i++) radios[i].checked = (radios[i].value === dom);
+
+                var detail = $('cpuDetail');
+                if (!rep.configured && (rep.detected || []).length) {
+                    detail.className = 'tip';
+                    detail.innerHTML = '检测到本机的 ComfyUI：<code>' + esc(rep.detected[0])
+                        + '</code> <button id="cpuUseDetected" type="button" '
+                        + 'style="height:26px;padding:0 9px;font-size:11px;margin-left:4px">用这个</button>';
+                    $('cpuUseDetected').onclick = function () {
+                        pathEl.value = rep.detected[0];
+                        $('cpuSave').click();
+                    };
+                } else {
+                    detail.className = '';
+                    detail.innerHTML = '';
+                }
+
+                var kv = [];
+                kv.push('路径', rep.install_dir ? '<code>' + esc(rep.install_dir) + '</code>'
+                                                : '<span class="faint">未设置</span>');
+                if ((rep.lora_folders || []).length) {
+                    kv.push('LoRA 目录', (rep.lora_folders || []).map(function (f) {
+                        return '<code>' + esc(f) + '</code>';
+                    }).join('<br>'));
+                }
+                if (rep.models_dir) kv.push('模型目录', '<code>' + esc(rep.models_dir) + '</code>');
+                if (rep.input_dir) kv.push('input 目录', '<code>' + esc(rep.input_dir) + '</code>');
+                kv.push('后端地址', '<b>' + esc(rep.address || '?') + '</b>' +
+                    (rep.address_local ? '（本机）' : '（不在本机，参考图直传会退回接口上传）'));
+                kv.push('自动拉起', rep.auto_start ? '开' : '关');
+                $('cpInfo').innerHTML = kv.map(function (v, i) {
+                    return i % 2 === 0 ? '<span>' + v + '</span>' : '<span>' + v + '</span>';
+                }).join('');
+            }
+
+            function refresh() {
+                return hj('/settings').then(function (d) {
+                    render(d.report);
+                    return d;
+                }).catch(function () { render(null); });
+            }
+
+            function afterAction(promise, btnId) {
+                if (busy) return;
+                busy = true;
+                var btn = $(btnId);
+                if (btn) btn.disabled = true;
+                promise.then(function (msg) {
+                    return refresh().then(function () { return msg; });
+                }).catch(function (e) {
+                    setStatus('<span class="bad">' + esc((e && e.message) || e) + '</span>');
+                }).then(function () {
+                    busy = false;
+                    if (btn) btn.disabled = false;
+                });
+            }
+
+            function showMissing(d) {
+                var box = $('cpuDetail');
+                var bad = d.bad || [];
+                if (!bad.length) {
+                    box.className = 'tip ok';
+                    box.textContent = '检查了 ' + d.workflows + ' 个工作流：模型都齐（本地索引 '
+                        + d.indexed + ' 个模型文件）';
+                    return;
+                }
+                var html = '<div class="status-line bad">' + bad.length + ' 个工作流缺模型</div>';
+                bad.slice(0, 8).forEach(function (row) {
+                    html += '<div class="wf">' + esc(row.name) + '</div><ul class="missing">';
+                    row.missing.slice(0, 6).forEach(function (m) {
+                        html += '<li><code>' + esc(m) + '</code></li>';
+                    });
+                    if (row.missing.length > 6) {
+                        html += '<li>…还有 ' + (row.missing.length - 6) + ' 个</li>';
+                    }
+                    html += '</ul>';
+                });
+                if (bad.length > 8) {
+                    html += '<div class="tip">…还有 ' + (bad.length - 8) + ' 个工作流缺模型</div>';
+                }
+                box.className = '';
+                box.innerHTML = html;
+            }
+
+            // 路径不给手打：点输入框或「浏览」都弹原生选文件夹对话框（真实路径只有本机进程拿得到）
+            function pick() {
+                if (busy) return;
+                busy = true;
+                setStatus('等你在弹出的对话框里选文件夹…');
+                hj('/pick-folder?initial=' + encodeURIComponent($('cpuPath').value.trim()))
+                    .then(function (d) {
+                        if (d.cancelled) { refresh(); return; }
+                        $('cpuPath').value = d.path || '';
+                        $('cpuSave').click();          // 选完直接落盘，少按一次
+                    })
+                    .catch(function (e) {
+                        setStatus('<span class="bad">' + esc((e && e.message) || e) + '</span>');
+                    })
+                    .then(function () { busy = false; });
+            }
+
+            $('cpuPath').addEventListener('click', pick);
+            $('cpuBrowse').onclick = pick;
+
+            $('cpuSave').onclick = function () {
+                var domSel = 'civitai.red';
+                var rds = document.querySelectorAll('input[name="civDomain"]');
+                for (var j = 0; j < rds.length; j++) if (rds[j].checked) domSel = rds[j].value;
+                var payload = { install_dir: $('cpuPath').value.trim(), auto_start: !!$('cpuAuto').checked,
+                                civitai_domain: domSel };
+                afterAction(hj('/settings', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                }).then(function (d) {
+                    var rep = d.report || {};
+                    if (payload.install_dir && !rep.exists) throw new Error('这个目录不存在');
+                    return payload.install_dir ? '已保存' : '已清空';
+                }), 'cpuSave');
+            };
+
+            $('cpuAuto').addEventListener('change', function () { $('cpuSave').click(); });
+
+            $('cpuLaunch').onclick = function () {
+                startedAt = Date.now();
+                afterAction(hj('/comfyui/start', { method: 'POST' })
+                    .then(function (d) { return d.message || '已发出启动命令'; }), 'cpuLaunch');
+            };
+
+            $('cpuCheck').onclick = function () {
+                if (busy) return;
+                busy = true;
+                $('cpuCheck').disabled = true;
+                setStatus('正在核对模型…');
+                hj('/model-check-all').then(function (d) {
+                    setStatus('模型索引 <b>' + d.indexed + '</b> 个文件 · ' + esc(d.message));
+                    showMissing(d);
+                }).catch(function (e) {
+                    setStatus('<span class="bad">' + esc((e && e.message) || e) + '</span>');
+                }).then(function () {
+                    busy = false;
+                    $('cpuCheck').disabled = false;
+                });
+            };
+
+            refresh();
+            // 点过启动之后短时轮询，让「运行中」及时亮起来
+            setInterval(function () {
+                if (startedAt && Date.now() - startedAt < 120000) refresh();
+            }, 6000);
+        })();
+    </script>
+</body>
+</html>
