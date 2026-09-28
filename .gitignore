@@ -28,3 +28,7 @@ AI-开工必读.md
 *.mojibake-backup
 *.stable-before-*
 static/js/i18n(1)/
+
+# ==== 敏感/本地专属（用户 2026-09-29 指定不入库）====
+API/
+workflows/
