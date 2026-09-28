@@ -1702,10 +1702,21 @@
                 </button>
             </div>
             <div style="padding:18px 22px 20px">
-                <div id="update-confirm-text" style="font-size:13.5px; line-height:1.75"></div>
-                <div style="display:flex; justify-content:flex-end; gap:10px; margin-top:20px">
-                    <button type="button" onclick="closeUpdateConfirm()" style="padding:8px 18px; border-radius:999px; border:1px solid rgba(127,127,127,.4); background:none; color:inherit; font:inherit; font-size:13px; font-weight:700; cursor:pointer">取消</button>
-                    <button type="button" onclick="applyUpdateNow()" style="padding:8px 22px; border-radius:999px; border:1px solid #16a34a; background:#16a34a; color:#fff; font:inherit; font-size:13px; font-weight:800; cursor:pointer">立即更新</button>
+                <div id="update-confirm-body">
+                    <div id="update-confirm-text" style="font-size:13.5px; line-height:1.75"></div>
+                    <div style="display:flex; justify-content:flex-end; gap:10px; margin-top:20px">
+                        <button type="button" onclick="closeUpdateConfirm()" style="padding:8px 18px; border-radius:999px; border:1px solid rgba(127,127,127,.4); background:none; color:inherit; font:inherit; font-size:13px; font-weight:700; cursor:pointer">取消</button>
+                        <button type="button" onclick="applyUpdateNow()" style="padding:8px 22px; border-radius:999px; border:1px solid #16a34a; background:#16a34a; color:#fff; font:inherit; font-size:13px; font-weight:800; cursor:pointer">立即更新</button>
+                    </div>
+                </div>
+                <div id="update-progress" style="display:none">
+                    <div id="update-progress-label" style="font-size:13.5px; font-weight:700; line-height:1.6">正在发起更新…</div>
+                    <div style="height:10px; border-radius:999px; background:rgba(127,127,127,.25); overflow:hidden; margin-top:14px">
+                        <div id="update-progress-fill" style="height:100%; width:0%; border-radius:999px; background:#16a34a; transition:width .35s ease"></div>
+                    </div>
+                    <div style="display:flex; justify-content:flex-end; margin-top:18px">
+                        <button type="button" id="update-progress-close" onclick="closeUpdateConfirm()" hidden style="padding:8px 18px; border-radius:999px; border:1px solid rgba(127,127,127,.4); background:none; color:inherit; font:inherit; font-size:13px; font-weight:700; cursor:pointer">关闭</button>
+                    </div>
                 </div>
             </div>
         </div>
@@ -2533,9 +2544,17 @@
             updateConfirmLatest = String(latest || "");
             const box = document.getElementById('update-confirm-modal');
             const txt = document.getElementById('update-confirm-text');
-            if (!box || !txt) return;
+            const body = document.getElementById('update-confirm-body');
+            const prog = document.getElementById('update-progress');
+            const fill = document.getElementById('update-progress-fill');
+            const xBtn = document.querySelector('#update-confirm-modal .studio-modal-close');
+            if (!box || !txt || !body || !prog) return;
             txt.textContent = '发现新版本 ' + updateConfirmLatest + '（当前 ' + (current || '?') +
                 '）。更新只替换程序文件，自动在 AI-Studio-Data\\update_backups\\ 留还原点，你的数据不受影响。现在就更新吗？';
+            body.style.display = '';                     // 每次打开都恢复成确认视图
+            prog.style.display = 'none';
+            if (fill) { fill.style.width = '0%'; fill.style.background = '#16a34a'; }
+            if (xBtn) xBtn.style.display = '';
             box.hidden = false;
         }
         function closeUpdateConfirm() {
@@ -2544,23 +2563,59 @@
             if (updateConfirmLatest) setPillPending(true);   // 用户取消 → pill 变绿色「一键更新」+ 红点
         }
         async function applyUpdateNow() {
+            // 进度视图：发起 → 轮询 /apply-update/progress（下载/解压/备份/替换各阶段实时刷新）
             const box = document.getElementById('update-confirm-modal');
-            if (box) box.hidden = true;
-            updateCheckToast('正在下载并应用更新…（约需几十秒，别关窗口）');
+            const body = document.getElementById('update-confirm-body');
+            const prog = document.getElementById('update-progress');
+            const fill = document.getElementById('update-progress-fill');
+            const label = document.getElementById('update-progress-label');
+            const closeBtn = document.getElementById('update-progress-close');
+            const xBtn = document.querySelector('#update-confirm-modal .studio-modal-close');
+            if (!box || !body || !prog || !fill || !label) return;
+            body.style.display = 'none';
+            prog.style.display = 'block';
+            fill.style.width = '0%';
+            fill.style.background = '#16a34a';
+            label.textContent = '正在发起更新…';
+            closeBtn.hidden = true;
+            if (xBtn) xBtn.style.display = 'none';       // 进行中不许关（关了就没地方看进度）
             try {
                 const res = await fetch(UPDATE_CHECK_HELPER + '/apply-update', {
                     method: 'POST', headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({}), cache: 'no-store'
                 });
                 const d = await res.json();
-                if (d && d.ok) {
-                    setPillPending(false);          // 更新成功：恢复成「检查更新」常态
-                    updateConfirmLatest = "";
-                    updateCheckToast(d.message || ('已更新到 ' + (d.latest || '?') + '，请重启应用'));
-                } else {
-                    updateCheckToast((d && d.error) || '更新失败');   // 失败：保持绿色一键更新，可再点重试
+                if (!d || !d.ok) {                       // 没配源/已是最新/已在进行中等
+                    label.textContent = (d && d.error) || '无法开始更新';
+                    closeBtn.hidden = false;
+                    if (xBtn) xBtn.style.display = '';
+                    return;
                 }
-            } catch (e) { updateCheckToast('更新失败：' + (e && e.message ? e.message : e)); }
+                for (;;) {
+                    await new Promise(r => setTimeout(r, 700));
+                    const pr = await fetch(UPDATE_CHECK_HELPER + '/apply-update/progress', { cache: 'no-store' });
+                    const s = await pr.json();
+                    fill.style.width = (s.pct || 0) + '%';
+                    label.textContent = s.msg || '…';
+                    if (s.done) {
+                        fill.style.width = '100%';
+                        const r2 = s.result || {};
+                        if (s.ok) {
+                            setPillPending(false);       // 成功：恢复「检查更新」常态
+                            updateConfirmLatest = "";
+                        } else {
+                            fill.style.background = '#dc2626';
+                        }
+                        closeBtn.hidden = false;
+                        if (xBtn) xBtn.style.display = '';
+                        break;
+                    }
+                }
+            } catch (e) {
+                label.textContent = '更新失败：' + (e && e.message ? e.message : e);
+                closeBtn.hidden = false;
+                if (xBtn) xBtn.style.display = '';
+            }
         }
         async function runProjectUpdate(silent) {
             // silent=true：启动时的自动检查 —— 只有查到新版才弹窗，其余情况一律不出声

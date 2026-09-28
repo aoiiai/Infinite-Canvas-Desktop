@@ -3182,17 +3182,73 @@ _CURL_EXE = shutil.which("curl")         # Win10+ 自带。2026-09-29 实测：�
                                          # → 更新链路一律优先 curl，urllib 只当 curl 缺失时的后备
 
 
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+
+_apply_state = {"running": False, "stage": "", "msg": "", "pct": 0,
+                "done": False, "ok": None, "result": None}
+
+def _set_apply(stage: str, msg: str = "", pct: int = 0,
+               running=None, done=None, ok=None, result=None) -> None:
+    """刷新 /apply-update/progress 的状态快照（apply_update 的后台线程写，前端轮询读）。"""
+    _apply_state["stage"] = stage
+    _apply_state["msg"] = msg
+    _apply_state["pct"] = int(pct)
+    if running is not None: _apply_state["running"] = running
+    if done is not None: _apply_state["done"] = done
+    if ok is not None: _apply_state["ok"] = ok
+    if result is not None: _apply_state["result"] = result
+
 def _curl_fetch(url: str, target: str, max_seconds: int, retries: int = 1) -> None:
-    """用系统 curl 下载到 target。失败抛异常（带 stderr 尾行）。"""
+    """用系统 curl 下载到 target。失败抛异常（带 stderr 尾行）。
+    ⚠ 必须带 CREATE_NO_WINDOW：curl 是控制台程序，从无窗口的 pythonw 启动会弹黑色 CMD 窗
+    （2026-09-29 用户反馈「不要弹 cmd 窗，就后台下载」）。"""
     if not _CURL_EXE:
         raise RuntimeError("系统里没有 curl.exe")
     cmd = [_CURL_EXE, "-sS", "-L", "--retry", str(retries), "--retry-delay", "2",
            "--retry-all-errors", "-m", str(max_seconds), "-A", "AI-Studio-Desktop",
            "--max-filesize", str(_UPDATE_ZIP_MAX), "-o", target, url]
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=max_seconds + 30)
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=max_seconds + 30,
+                          creationflags=_NO_WINDOW)
     if proc.returncode != 0:
         tail = [ln for ln in (proc.stderr or "").strip().splitlines() if ln.strip()]
         raise RuntimeError("curl rc=%s %s" % (proc.returncode, tail[-1] if tail else ""))
+
+def _curl_download_progress(url: str, target: str, max_seconds: int, total: int, on_pct) -> None:
+    """带进度回调的下载：Popen 启动 curl（无窗口），轮询落盘字节数算百分比。
+    total 来自 Release 资产元数据（字节）；on_pct(0~100)。超时/非零退出抛异常。"""
+    if not _CURL_EXE:
+        raise RuntimeError("系统里没有 curl.exe")
+    cmd = [_CURL_EXE, "-sS", "-L", "--retry", "2", "--retry-delay", "2",
+           "--retry-all-errors", "-m", str(max_seconds), "-A", "AI-Studio-Desktop",
+           "--max-filesize", str(_UPDATE_ZIP_MAX), "-o", target, url]
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                            creationflags=_NO_WINDOW)
+    deadline = time.time() + max_seconds
+    try:
+        while proc.poll() is None:
+            if time.time() > deadline:
+                proc.kill()
+                raise RuntimeError("下载超时（%d 秒）" % max_seconds)
+            try:
+                done = os.path.getsize(target)
+            except OSError:
+                done = 0
+            on_pct(min(99, int(done * 100 / total)) if total > 0 else 0)
+            time.sleep(0.4)
+        if proc.returncode != 0:
+            tail = ""
+            try:
+                lines = [ln for ln in (proc.stderr.read() or b"").decode("utf-8", "replace").splitlines() if ln.strip()]
+                tail = lines[-1] if lines else ""
+            except Exception:
+                pass
+            raise RuntimeError("curl rc=%s %s" % (proc.returncode, tail))
+        on_pct(100)
+    finally:
+        try:
+            proc.stderr.close()
+        except Exception:
+            pass
 
 
 def _update_repo_from_url(url: str):
@@ -3219,6 +3275,10 @@ def _update_file_allowed(rel: str) -> bool:
 
 
 def apply_update(force: bool = False) -> dict:
+    """POST /apply-update：同步做「拿 release 元数据 + 版本守卫」（秒级），重活丢后台线程；
+    进度走 GET /apply-update/progress（2026-09-29 用户要下载进度条 + 不要弹 CMD 窗）。"""
+    if _apply_state.get("running"):
+        return {"ok": False, "error": "更新正在进行中，请看进度条"}
     cur = _read_project_version()
     url = ""
     try:
@@ -3234,7 +3294,48 @@ def apply_update(force: bool = False) -> dict:
     if not repo_id:
         return {"ok": False, "error": "version_url 解析不出 GitHub 仓库（支持 raw / jsDelivr 的 VERSION 地址）"}
     owner, repo, branch = repo_tuple
-    import urllib.request as _ur
+    staging = os.path.join(state_dir(), "update_staging")
+    shutil.rmtree(staging, ignore_errors=True)
+    os.makedirs(staging, exist_ok=True)
+    # 元数据同步拉（秒级）：latest + 资产 URL + 资产大小（给进度条算百分比）
+    meta_t = os.path.join(staging, "_meta.json")
+    try:
+        _curl_fetch("https://api.github.com/repos/%s/%s/releases/latest" % (owner, repo),
+                    meta_t, 20, retries=2)
+        with open(meta_t, "r", encoding="utf-8") as fh:
+            meta = json.load(fh)
+        os.remove(meta_t)
+    except Exception as exc:
+        shutil.rmtree(staging, ignore_errors=True)
+        return {"ok": False, "error": "拉取 release 信息失败：%s" % exc}
+    tag = str(meta.get("tag_name") or "").strip()
+    asset_url = ""
+    asset_total = 0
+    for a in (meta.get("assets") or []):
+        if str(a.get("name") or "") == "update.zip":
+            asset_url = str(a.get("browser_download_url") or "")
+            asset_total = int(a.get("size") or 0)
+    latest = tag.lstrip("vV").strip()
+    if not asset_url:
+        shutil.rmtree(staging, ignore_errors=True)
+        return {"ok": False, "error": "release 缺 update.zip 资产"}
+    if not force and not _ver_newer(latest, cur):
+        shutil.rmtree(staging, ignore_errors=True)
+        return {"ok": False, "current": cur, "latest": latest,
+                "error": "已是最新（%s），无需更新" % (cur or "?")}
+    _set_apply("download", "正在下载更新包…", 0, running=True, done=False, ok=None, result=None)
+    threading.Thread(target=apply_update_worker, daemon=True, kwargs=dict(
+        repo_id=repo_id, owner=owner, repo=repo, zip_urls=zip_urls,
+        asset_url=asset_url, asset_total=asset_total, cur=cur, force=force,
+        latest_from_tag=latest)).start()
+    return {"ok": True, "started": True, "latest": latest}
+
+
+def apply_update_worker(repo_id: str, owner: str, repo: str, zip_urls: list,
+                        asset_url: str, asset_total: int, cur: str, force: bool,
+                        latest_from_tag: str) -> None:
+    """apply_update 的重活（后台线程）：下载（带进度）→ 解压校验 → 还原点 → 替换。
+    任何出口都必须 _set_apply(..., done=True, ok=..., result=...)，前端轮询靠它收尾。"""
     import zipfile as _zf
     staging = os.path.join(state_dir(), "update_staging")
 
@@ -3242,181 +3343,183 @@ def apply_update(force: bool = False) -> dict:
         shutil.rmtree(staging, ignore_errors=True)
         os.makedirs(staging, exist_ok=True)
 
-    _reset_staging()
-    latest = ""
+    latest = latest_from_tag
     via = ""
     staged = False
     release_err = ""
-    # —— 路线 A（首选）：GitHub Release 资产。tag 不可变（永无陈旧缓存）、不走 codeload、
-    #    实测匿名下载 3/3 成功（2.9MB，1.5~30 秒）。资产 = update.zip（git archive 平铺白名单文件）。
     try:
-        meta_t = os.path.join(staging, "_meta.json")
-        _curl_fetch("https://api.github.com/repos/%s/%s/releases/latest" % (owner, repo),
-                    meta_t, 20, retries=2)
-        with open(meta_t, "r", encoding="utf-8") as fh:
-            meta = json.load(fh)
-        os.remove(meta_t)
-        tag = str(meta.get("tag_name") or "").strip()
-        asset_url = ""
-        for a in (meta.get("assets") or []):
-            if str(a.get("name") or "") == "update.zip":
-                asset_url = str(a.get("browser_download_url") or "")
-        if not tag or not asset_url:
-            raise RuntimeError("release 缺 tag 或 update.zip 资产")
-        latest = tag.lstrip("vV")
+        # —— 路线 A（首选）：Release 资产，带下载进度条（总大小来自资产元数据）——
+        try:
+            zip_t = os.path.join(staging, "update.zip")
+            _set_apply("download", "正在下载更新包…", 0)
+            _curl_download_progress(asset_url, zip_t, 300, asset_total,
+                                    lambda p: _set_apply("download", "正在下载更新包… %d%%" % p, p))
+            _set_apply("extract", "解压校验更新包…", 100)
+            with _zf.ZipFile(zip_t) as zf:
+                names = zf.namelist()
+                if not names or len(names) > _UPDATE_ENTRIES_MAX:
+                    raise RuntimeError("更新包含 %d 个条目，超出保护上限" % len(names))
+                for info in zf.infolist():
+                    rel = info.filename.replace("\\", "/")
+                    if not rel or rel.endswith("/"):
+                        continue
+                    if rel.lstrip("/").startswith("/") or ".." in rel.split("/"):
+                        raise RuntimeError("更新包含可疑路径，已中止")
+                    if not _update_file_allowed(rel):
+                        continue
+                    target = os.path.join(staging, *rel.split("/"))
+                    os.makedirs(os.path.dirname(target), exist_ok=True)
+                    with zf.open(info) as src, open(target, "wb") as dst:
+                        shutil.copyfileobj(src, dst, 256 * 1024)
+            os.remove(zip_t)
+            via = "Release资产"
+            staged = True
+        except Exception as exc:
+            release_err = str(exc)
+            _reset_staging()
+        # —— 路线 B（兜底）：仓库 zip（codeload → api zipball，每次 45 秒墙钟预算）。
+        #    无资产元数据 ⇒ 没有进度数字，只有阶段文字；codeload 归档有分钟级缓存，只是兜底。
+        if not staged:
+            last_err = ""
+            zip_ok = False
+            for zip_url in zip_urls:
+                try:
+                    zip_target = os.path.join(staging, "repo.zip")
+                    _set_apply("download", "正在下载更新包（备用源）…", 0)
+                    if _CURL_EXE:
+                        _curl_fetch(zip_url, zip_target, 45, retries=1)   # 45s：慢滴直接放弃换路线
+                    else:
+                        import urllib.request as _ur
+                        t0 = time.time()
+                        req = _ur.Request(zip_url, headers={"User-Agent": "AI-Studio-Desktop"})
+                        with _ur.urlopen(req, timeout=30) as resp, open(zip_target, "wb") as out:
+                            total = 0
+                            while True:
+                                if time.time() - t0 > 45:
+                                    raise RuntimeError("下载超 45 秒未完成（zip 源被限速），换下一条路线")
+                                chunk = resp.read(256 * 1024)
+                                if not chunk:
+                                    break
+                                total += len(chunk)
+                                if total > _UPDATE_ZIP_MAX:
+                                    raise RuntimeError("更新包超过 %d MB，已中止" % (_UPDATE_ZIP_MAX // 1024 // 1024))
+                                out.write(chunk)
+                except Exception as exc:
+                    last_err = "zip 下载失败（%s）：%s" % (zip_url.split("/")[2], exc)
+                    _reset_staging()
+                    continue
+                try:
+                    _set_apply("extract", "解压校验更新包…", 0)
+                    with _zf.ZipFile(os.path.join(staging, "repo.zip")) as zf:
+                        names = zf.namelist()
+                        if not names or len(names) > _UPDATE_ENTRIES_MAX:
+                            raise RuntimeError("更新包含 %d 个条目，超出保护上限" % len(names))
+                        top = names[0].split("/")[0]
+                        for info in zf.infolist():
+                            rel = info.filename.replace("\\", "/")
+                            if rel.startswith(top + "/"):
+                                rel = rel[len(top) + 1:]
+                            if not rel or rel.endswith("/"):
+                                continue
+                            if rel.lstrip("/").startswith("/") or ".." in rel.split("/"):
+                                raise RuntimeError("更新包含可疑路径，已中止")
+                            if not _update_file_allowed(rel):
+                                continue
+                            target = os.path.join(staging, *rel.split("/"))
+                            os.makedirs(os.path.dirname(target), exist_ok=True)
+                            with zf.open(info) as src, open(target, "wb") as dst:
+                                shutil.copyfileobj(src, dst, 256 * 1024)
+                    zip_ok = True
+                    via = "zip"
+                    staged = True
+                    break
+                except Exception as exc:
+                    last_err = "解压失败：%s" % exc
+                    _reset_staging()
+            if not staged:
+                shutil.rmtree(staging, ignore_errors=True)
+                _set_apply("failed", "更新失败", 0, running=False, done=True, ok=False,
+                           result={"ok": False, "error": "Release 路线失败（%s）；%s" % (release_err or "无 release", last_err or "未知")})
+                return
+        # 校验 staging：VERSION 必须在、static/ 必须非空
+        _set_apply("verify", "校验更新包…", 0)
+        try:
+            with open(os.path.join(staging, "VERSION"), "r", encoding="utf-8") as fh:
+                latest = (fh.read().strip().splitlines() or [""])[0].strip()
+        except Exception:
+            latest = ""
+        staged_static = os.path.join(staging, "static")
+        staged_static_count = sum(len(fs) for _, _, fs in os.walk(staged_static)) if os.path.isdir(staged_static) else 0
+        if not latest or not staged_static_count:
+            shutil.rmtree(staging, ignore_errors=True)
+            _set_apply("failed", "更新包不完整", 0, running=False, done=True, ok=False,
+                       result={"ok": False, "error": "更新包不完整（缺 VERSION 或 static/ 为空），已取消"})
+            return
         if not force and not _ver_newer(latest, cur):
             shutil.rmtree(staging, ignore_errors=True)
-            return {"ok": False, "current": cur, "latest": latest,
-                    "error": "已是最新（%s），无需更新" % (cur or "?")}
-        _curl_fetch(asset_url, os.path.join(staging, "update.zip"), 300, retries=3)
-        with _zf.ZipFile(os.path.join(staging, "update.zip")) as zf:
-            names = zf.namelist()
-            if not names or len(names) > _UPDATE_ENTRIES_MAX:
-                raise RuntimeError("更新包含 %d 个条目，超出保护上限" % len(names))
-            for info in zf.infolist():
-                rel = info.filename.replace("\\", "/")
-                if not rel or rel.endswith("/"):
-                    continue
-                if rel.lstrip("/").startswith("/") or ".." in rel.split("/"):
-                    raise RuntimeError("更新包含可疑路径，已中止")
-                if not _update_file_allowed(rel):
-                    continue
-                target = os.path.join(staging, *rel.split("/"))
-                os.makedirs(os.path.dirname(target), exist_ok=True)
-                with zf.open(info) as src, open(target, "wb") as dst:
-                    shutil.copyfileobj(src, dst, 256 * 1024)
-        os.remove(os.path.join(staging, "update.zip"))
-        via = "Release资产"
-        staged = True
-    except Exception as exc:
-        release_err = str(exc)
-        _reset_staging()
-    # —— 路线 B（兜底）：仓库 zip（codeload → api zipball，每次 45 秒墙钟预算）。
-    #    ⚠ 慢滴连接永远不会触发 socket 超时（实测 codeload ~45KB/s），必须按墙钟放弃换路线；
-    #    ⚠ codeload 归档有分钟级缓存，强推后立刻拉可能拿到旧树 —— 所以只是兜底不是首选。
-    if not staged:
-        last_err = ""
-        zip_ok = False
-        for zip_url in zip_urls:
-            try:
-                zip_target = os.path.join(staging, "repo.zip")
-                if _CURL_EXE:
-                    _curl_fetch(zip_url, zip_target, 45, retries=1)   # 45s：慢滴直接放弃换路线
-                else:
-                    t0 = time.time()
-                    req = _ur.Request(zip_url, headers={"User-Agent": "AI-Studio-Desktop"})
-                    with _ur.urlopen(req, timeout=30) as resp, open(zip_target, "wb") as out:
-                        total = 0
-                        while True:
-                            if time.time() - t0 > 45:
-                                raise RuntimeError("下载超 45 秒未完成（zip 源被限速），换下一条路线")
-                            chunk = resp.read(256 * 1024)
-                            if not chunk:
-                                break
-                            total += len(chunk)
-                            if total > _UPDATE_ZIP_MAX:
-                                raise RuntimeError("更新包超过 %d MB，已中止" % (_UPDATE_ZIP_MAX // 1024 // 1024))
-                            out.write(chunk)
-            except Exception as exc:
-                last_err = "zip 下载失败（%s）：%s" % (zip_url.split("/")[2], exc)
-                _reset_staging()
-                continue
-            try:
-                with _zf.ZipFile(os.path.join(staging, "repo.zip")) as zf:
-                    names = zf.namelist()
-                    if not names or len(names) > _UPDATE_ENTRIES_MAX:
-                        raise RuntimeError("更新包含 %d 个条目，超出保护上限" % len(names))
-                    top = names[0].split("/")[0]
-                    for info in zf.infolist():
-                        rel = info.filename.replace("\\", "/")
-                        if rel.startswith(top + "/"):
-                            rel = rel[len(top) + 1:]
-                        if not rel or rel.endswith("/"):
-                            continue
-                        if rel.lstrip("/").startswith("/") or ".." in rel.split("/"):
-                            raise RuntimeError("更新包含可疑路径，已中止")
-                        if not _update_file_allowed(rel):
-                            continue
-                        target = os.path.join(staging, *rel.split("/"))
-                        os.makedirs(os.path.dirname(target), exist_ok=True)
-                        with zf.open(info) as src, open(target, "wb") as dst:
-                            shutil.copyfileobj(src, dst, 256 * 1024)
-                zip_ok = True
-                via = "zip"
-                staged = True
-                break
-            except Exception as exc:
-                last_err = "解压失败：%s" % exc
-                _reset_staging()
-        if not staged:
-            shutil.rmtree(staging, ignore_errors=True)
-            return {"ok": False,
-                    "error": "Release 路线失败（%s）；%s" % (release_err or "无 release", last_err or "未知")}
-    # 3) 校验 staging：VERSION 必须在、static/ 必须非空
-    try:
-        with open(os.path.join(staging, "VERSION"), "r", encoding="utf-8") as fh:
-            latest = (fh.read().strip().splitlines() or [""])[0].strip()
-    except Exception:
-        latest = ""
-    staged_static = os.path.join(staging, "static")
-    staged_static_count = sum(len(fs) for _, _, fs in os.walk(staged_static)) if os.path.isdir(staged_static) else 0
-    if not latest or not staged_static_count:
-        shutil.rmtree(staging, ignore_errors=True)
-        return {"ok": False, "error": "更新包不完整（缺 VERSION 或 static/ 为空），已取消"}
-    if not force and not _ver_newer(latest, cur):
-        shutil.rmtree(staging, ignore_errors=True)
-        return {"ok": False, "current": cur, "latest": latest,
-                "error": "已是最新（%s），无需更新" % (cur or "?")}
-    # 4) 还原点：当前将被替换的文件先备份
-    backups_root = os.path.join(state_dir(), "update_backups")
-    os.makedirs(backups_root, exist_ok=True)
-    backup_dir = os.path.join(backups_root, time.strftime("%Y%m%d-%H%M%S"))
-    os.makedirs(backup_dir, exist_ok=True)
-    for name in _UPDATE_ALLOWED_ROOT_FILES:
-        p = os.path.join(PROJECT_DIR, name)
-        if os.path.isfile(p):
-            shutil.copy2(p, os.path.join(backup_dir, name))
-    if os.path.isdir(os.path.join(PROJECT_DIR, "static")):
-        shutil.copytree(os.path.join(PROJECT_DIR, "static"), os.path.join(backup_dir, "static"))
-    olds = sorted(d for d in os.listdir(backups_root) if os.path.isdir(os.path.join(backups_root, d)))
-    while len(olds) > _UPDATE_BACKUP_KEEP:
-        shutil.rmtree(os.path.join(backups_root, olds.pop(0)), ignore_errors=True)
-    # 5) 应用：先根文件（逐个原子替换），再 static/ 整目录替换（上游删掉的本地也删）
-    updated = []
-    try:
-        for name in sorted(_UPDATE_ALLOWED_ROOT_FILES):
-            src = os.path.join(staging, name)
-            if not os.path.isfile(src):
-                continue
-            dst = os.path.join(PROJECT_DIR, name)
-            tmp = dst + ".update_tmp"
-            shutil.copy2(src, tmp)
-            os.replace(tmp, dst)
-            updated.append(name)
-        shutil.rmtree(os.path.join(PROJECT_DIR, "static"))
-        shutil.copytree(staged_static, os.path.join(PROJECT_DIR, "static"))
-        updated.append("static/（%d 个文件）" % staged_static_count)
-    except Exception as exc:
-        # 失败即回滚：根文件用还原点覆盖回去，static/ 整目录从还原点恢复
+            _set_apply("failed", "无需更新", 0, running=False, done=True, ok=False,
+                       result={"ok": False, "current": cur, "latest": latest,
+                               "error": "已是最新（%s），无需更新" % (cur or "?")})
+            return
+        # 还原点：当前将被替换的文件先备份
+        _set_apply("backup", "备份当前版本（生成还原点）…", 0)
+        backups_root = os.path.join(state_dir(), "update_backups")
+        os.makedirs(backups_root, exist_ok=True)
+        backup_dir = os.path.join(backups_root, time.strftime("%Y%m%d-%H%M%S"))
+        os.makedirs(backup_dir, exist_ok=True)
+        for name in _UPDATE_ALLOWED_ROOT_FILES:
+            p = os.path.join(PROJECT_DIR, name)
+            if os.path.isfile(p):
+                shutil.copy2(p, os.path.join(backup_dir, name))
+        if os.path.isdir(os.path.join(PROJECT_DIR, "static")):
+            shutil.copytree(os.path.join(PROJECT_DIR, "static"), os.path.join(backup_dir, "static"))
+        olds = sorted(d for d in os.listdir(backups_root) if os.path.isdir(os.path.join(backups_root, d)))
+        while len(olds) > _UPDATE_BACKUP_KEEP:
+            shutil.rmtree(os.path.join(backups_root, olds.pop(0)), ignore_errors=True)
+        # 应用：先根文件（逐个原子替换），再 static/ 整目录替换（上游删掉的本地也删）
+        _set_apply("apply", "替换程序文件…", 0)
+        updated = []
         try:
-            for name in updated:
-                if name.startswith("static/"):
+            for name in sorted(_UPDATE_ALLOWED_ROOT_FILES):
+                src = os.path.join(staging, name)
+                if not os.path.isfile(src):
                     continue
-                b = os.path.join(backup_dir, name)
-                if os.path.isfile(b):
-                    shutil.copy2(b, os.path.join(PROJECT_DIR, name))
-            b_static = os.path.join(backup_dir, "static")
-            if os.path.isdir(b_static):
-                shutil.rmtree(os.path.join(PROJECT_DIR, "static"), ignore_errors=True)
-                shutil.copytree(b_static, os.path.join(PROJECT_DIR, "static"))
-        except Exception:
-            pass
+                dst = os.path.join(PROJECT_DIR, name)
+                tmp = dst + ".update_tmp"
+                shutil.copy2(src, tmp)
+                os.replace(tmp, dst)
+                updated.append(name)
+            shutil.rmtree(os.path.join(PROJECT_DIR, "static"))
+            shutil.copytree(staged_static, os.path.join(PROJECT_DIR, "static"))
+            updated.append("static/（%d 个文件）" % staged_static_count)
+        except Exception as exc:
+            # 失败即回滚：根文件用还原点覆盖回去，static/ 整目录从还原点恢复
+            try:
+                for name in updated:
+                    if name.startswith("static/"):
+                        continue
+                    b = os.path.join(backup_dir, name)
+                    if os.path.isfile(b):
+                        shutil.copy2(b, os.path.join(PROJECT_DIR, name))
+                b_static = os.path.join(backup_dir, "static")
+                if os.path.isdir(b_static):
+                    shutil.rmtree(os.path.join(PROJECT_DIR, "static"), ignore_errors=True)
+                    shutil.copytree(b_static, os.path.join(PROJECT_DIR, "static"))
+            except Exception:
+                pass
+            shutil.rmtree(staging, ignore_errors=True)
+            _set_apply("failed", "已回滚到还原点", 0, running=False, done=True, ok=False,
+                       result={"ok": False, "error": "应用更新失败，已回滚到还原点：%s" % exc})
+            return
         shutil.rmtree(staging, ignore_errors=True)
-        return {"ok": False, "error": "应用更新失败，已回滚到还原点：%s" % exc}
-    shutil.rmtree(staging, ignore_errors=True)
-    return {"ok": True, "repo": repo_id, "current": cur, "latest": latest, "via": via,
-            "updated": updated, "backup": os.path.basename(backup_dir),
-            "restart_required": True, "message": "已更新到 %s，请重启应用" % latest}
+        result = {"ok": True, "repo": repo_id, "current": cur, "latest": latest, "via": via,
+                  "updated": updated, "backup": os.path.basename(backup_dir),
+                  "restart_required": True, "message": "已更新到 %s，请重启应用" % latest}
+        _set_apply("done", result["message"], 100, running=False, done=True, ok=True, result=result)
+    except Exception as exc:      # 兜底：worker 里任何未捕获异常也要落进状态，前端才能收尾
+        shutil.rmtree(staging, ignore_errors=True)
+        _set_apply("failed", "更新失败", 0, running=False, done=True, ok=False,
+                   result={"ok": False, "error": str(exc)})
 
 
 class _HelperHandler(BaseHTTPRequestHandler):
@@ -3551,6 +3654,8 @@ class _HelperHandler(BaseHTTPRequestHandler):
                 return self._json({"ok": True, "service": "AI Studio helper", "version": 1})
             if path == "/check-update":
                 return self._json(check_update())
+            if path == "/apply-update/progress":
+                return self._json(dict(_apply_state))
             if path == "/asset-favorites":
                 return self._json(asset_favorites_get())
             # Seedance 桥接：透传上游 /v1/models，让应用里的「测试连接」按钮能通
