@@ -3119,31 +3119,50 @@ def check_update() -> dict:
     out = {"ok": True, "configured": bool(url), "current": cur}
     if not url:
         return out
-    try:
-        latest = ""
-        if _CURL_EXE:
-            # curl 优先：受限网络按 TLS 指纹拦 python-urllib（见 _CURL_EXE 处的实测注释）
-            tmp = os.path.join(state_dir(), "_ver_fetch.txt")
-            try:
-                _curl_fetch(url, tmp, 8, retries=2)
-                with open(tmp, "r", encoding="utf-8", errors="replace") as fh:
-                    latest = (fh.read().strip().splitlines() or [""])[0].strip()
-            finally:
+    latest = ""
+    err = ""
+    # ① 主源：GitHub releases/latest API —— 实时、无 CDN 缓存。
+    #    （2026-09-29 教训：jsDelivr @main 有小时级缓存，发版后用户迟迟查不到更新。）
+    #    从 version_url 解析出仓库才走这步；拿不到（没 release/网络断）就退回备源。
+    _rid, _zips, repo_tuple = _update_repo_from_url(url)
+    if repo_tuple:
+        _owner, _repo, _branch = repo_tuple
+        meta_t = os.path.join(state_dir(), "_rel_meta.json")
+        try:
+            _curl_fetch("https://api.github.com/repos/%s/%s/releases/latest" % (_owner, _repo),
+                        meta_t, 10, retries=2)
+            with open(meta_t, "r", encoding="utf-8") as fh:
+                latest = str(json.load(fh).get("tag_name") or "").lstrip("vV").strip()
+            os.remove(meta_t)
+        except Exception as exc:
+            err = "releases 拉取失败：%s" % exc
+    # ② 备源：version_url 文本（jsDelivr/raw 的 VERSION；有 CDN 缓存延迟，只兜底）
+    if not latest:
+        try:
+            if _CURL_EXE:
+                # curl 优先：受限网络按 TLS 指纹拦 python-urllib（见 _CURL_EXE 处的实测注释）
+                tmp = os.path.join(state_dir(), "_ver_fetch.txt")
                 try:
-                    os.remove(tmp)
-                except OSError:
-                    pass
-        else:
-            import urllib.request as _ur  # 懒加载：只有真配了更新源才会走到
-            req = _ur.Request(url, headers={"User-Agent": "AI-Studio-Desktop"})
-            with _ur.urlopen(req, timeout=8) as resp:
-                latest = (resp.read(4096).decode("utf-8", errors="replace")
-                          .strip().splitlines() or [""])[0].strip()
-        out["latest"] = latest
-        out["has_update"] = bool(latest) and _ver_newer(latest, cur)
-    except Exception as exc:
-        out["ok"] = False
-        out["error"] = "拉取失败：%s" % exc
+                    _curl_fetch(url, tmp, 8, retries=2)
+                    with open(tmp, "r", encoding="utf-8", errors="replace") as fh:
+                        latest = (fh.read().strip().splitlines() or [""])[0].strip()
+                finally:
+                    try:
+                        os.remove(tmp)
+                    except OSError:
+                        pass
+            else:
+                import urllib.request as _ur  # 懒加载：只有真配了更新源才会走到
+                req = _ur.Request(url, headers={"User-Agent": "AI-Studio-Desktop"})
+                with _ur.urlopen(req, timeout=8) as resp:
+                    latest = (resp.read(4096).decode("utf-8", errors="replace")
+                              .strip().splitlines() or [""])[0].strip()
+        except Exception as exc:
+            out["ok"] = False
+            out["error"] = ((err + "；") if err else "") + "拉取失败：%s" % exc
+            return out
+    out["latest"] = latest
+    out["has_update"] = bool(latest) and _ver_newer(latest, cur)
     return out
 
 
