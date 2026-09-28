@@ -3120,11 +3120,25 @@ def check_update() -> dict:
     if not url:
         return out
     try:
-        import urllib.request as _ur  # 懒加载：只有真配了更新源才会走到
-        req = _ur.Request(url, headers={"User-Agent": "AI-Studio-Desktop"})
-        with _ur.urlopen(req, timeout=8) as resp:
-            latest = (resp.read(4096).decode("utf-8", errors="replace")
-                      .strip().splitlines() or [""])[0].strip()
+        latest = ""
+        if _CURL_EXE:
+            # curl 优先：受限网络按 TLS 指纹拦 python-urllib（见 _CURL_EXE 处的实测注释）
+            tmp = os.path.join(state_dir(), "_ver_fetch.txt")
+            try:
+                _curl_fetch(url, tmp, 8, retries=2)
+                with open(tmp, "r", encoding="utf-8", errors="replace") as fh:
+                    latest = (fh.read().strip().splitlines() or [""])[0].strip()
+            finally:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+        else:
+            import urllib.request as _ur  # 懒加载：只有真配了更新源才会走到
+            req = _ur.Request(url, headers={"User-Agent": "AI-Studio-Desktop"})
+            with _ur.urlopen(req, timeout=8) as resp:
+                latest = (resp.read(4096).decode("utf-8", errors="replace")
+                          .strip().splitlines() or [""])[0].strip()
         out["latest"] = latest
         out["has_update"] = bool(latest) and _ver_newer(latest, cur)
     except Exception as exc:
@@ -3144,6 +3158,22 @@ _UPDATE_ALLOWED_ROOT_FILES = {"main.py", "VERSION", "AI-Studio-Desktop.pyw", "AI
 _UPDATE_ZIP_MAX = 400 * 1024 * 1024      # 更新包下载/单文件解压上限
 _UPDATE_ENTRIES_MAX = 8000               # 解压条目上限（zip 炸弹保护）
 _UPDATE_BACKUP_KEEP = 10                 # 还原点保留个数（与 main.py 的口径一致）
+_CURL_EXE = shutil.which("curl")         # Win10+ 自带。2026-09-29 实测：受限网络按 TLS 指纹拦
+                                         # python-urllib（10054），curl 同一时刻同一 URL 大概率能过
+                                         # → 更新链路一律优先 curl，urllib 只当 curl 缺失时的后备
+
+
+def _curl_fetch(url: str, target: str, max_seconds: int, retries: int = 1) -> None:
+    """用系统 curl 下载到 target。失败抛异常（带 stderr 尾行）。"""
+    if not _CURL_EXE:
+        raise RuntimeError("系统里没有 curl.exe")
+    cmd = [_CURL_EXE, "-sS", "-L", "--retry", str(retries), "--retry-delay", "2",
+           "--retry-all-errors", "-m", str(max_seconds), "-A", "AI-Studio-Desktop",
+           "--max-filesize", str(_UPDATE_ZIP_MAX), "-o", target, url]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=max_seconds + 30)
+    if proc.returncode != 0:
+        tail = [ln for ln in (proc.stderr or "").strip().splitlines() if ln.strip()]
+        raise RuntimeError("curl rc=%s %s" % (proc.returncode, tail[-1] if tail else ""))
 
 
 def _update_repo_from_url(url: str):
@@ -3171,14 +3201,34 @@ def _update_file_allowed(rel: str) -> bool:
 
 def _update_files_via_cdn(owner: str, repo: str, branch: str, staging: str) -> int:
     """兜底路线（2026-09-29 实测）：codeload 对受限网络 QoS 限速到 ~45KB/s（14MB 要 5 分多钟），
-    而 api.github.com 和 cdn.jsdelivr.net 都秒开 → 用 api 拿文件清单、CDN 逐文件下载。
-    返回下载文件数；失败抛异常（此时 staging 已脏，由调用方清理）。"""
+    而 api.github.com 和 cdn.jsdelivr.net 都快 → 用 api 拿文件清单、CDN 逐文件下载。
+    ⚠ 受限网络对什么都会间歇性 RST（10054），每个请求必须自带重试，否则 157 个文件
+    只要断一个就全盘失败。返回下载文件数；失败抛异常（此时 staging 已脏，由调用方清理）。"""
     import urllib.request as _ur
+
+    def _fetch_to(url: str, target: str, timeout: int, tries: int = 3) -> None:
+        last = None
+        for k in range(tries):
+            try:
+                if _CURL_EXE:
+                    _curl_fetch(url, target, timeout, retries=1)
+                else:
+                    import urllib.request as _ur
+                    req = _ur.Request(url, headers={"User-Agent": "AI-Studio-Desktop"})
+                    with _ur.urlopen(req, timeout=timeout) as resp, open(target, "wb") as out:
+                        shutil.copyfileobj(resp, out, 256 * 1024)
+                return
+            except Exception as exc:
+                last = exc
+                time.sleep(2 * (k + 1))
+        raise RuntimeError("%s → %s" % (url.split("/")[2], last))
+
     tree_url = "https://api.github.com/repos/%s/%s/git/trees/%s?recursive=1" % (owner, repo, branch)
-    req = _ur.Request(tree_url, headers={"User-Agent": "AI-Studio-Desktop",
-                                         "Accept": "application/vnd.github+json"})
-    with _ur.urlopen(req, timeout=30) as resp:
-        data = json.loads(resp.read(20 * 1024 * 1024).decode("utf-8"))
+    tmp = os.path.join(staging, "_tree.json")
+    _fetch_to(tree_url, tmp, 30)
+    with open(tmp, "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+    os.remove(tmp)
     if data.get("truncated"):
         raise RuntimeError("仓库文件清单被截断")
     blobs = [e for e in (data.get("tree") or [])
@@ -3186,6 +3236,9 @@ def _update_files_via_cdn(owner: str, repo: str, branch: str, staging: str) -> i
     if not blobs:
         raise RuntimeError("文件清单里没有可更新的文件")
     total = 0
+    done = 0
+    # jsDelivr 三域名轮换：受限网络会间歇性 RST（实测 ~1/3），换 SNI 域名常能绕开
+    cdn_hosts = ("cdn.jsdelivr.net", "fastly.jsdelivr.net", "gcore.jsdelivr.net")
     for e in blobs:
         rel = str(e["path"]).replace("\\", "/")
         size = int(e.get("size") or 0)
@@ -3195,11 +3248,23 @@ def _update_files_via_cdn(owner: str, repo: str, branch: str, staging: str) -> i
         raw = "https://cdn.jsdelivr.net/gh/%s/%s@%s/%s" % (owner, repo, branch, rel)
         target = os.path.join(staging, *rel.split("/"))
         os.makedirs(os.path.dirname(target), exist_ok=True)
-        req2 = _ur.Request(raw, headers={"User-Agent": "AI-Studio-Desktop"})
-        with _ur.urlopen(req2, timeout=60) as resp2, open(target, "wb") as out:
-            shutil.copyfileobj(resp2, out, 256 * 1024)
+        last = None
+        for k in range(6):
+            try:
+                _fetch_to(raw.replace("cdn.jsdelivr.net", cdn_hosts[k % len(cdn_hosts)], 1),
+                          target, 60, 1)
+                last = None
+                break
+            except Exception as exc:
+                last = exc
+                time.sleep(1 + k)
+        if last is not None:
+            raise RuntimeError("文件 %s：%s" % (rel, last))
         if os.path.getsize(target) != size:
             raise RuntimeError("文件下载不完整：%s" % rel)
+        done += 1
+        if done % 20 == 0:
+            time.sleep(0.5)      # 别太猛，避免触发 CDN 限流
     return len(blobs)
 
 
@@ -3235,20 +3300,24 @@ def apply_update(force: bool = False) -> dict:
     zip_ok = False
     for zip_url in zip_urls:
         try:
-            t0 = time.time()
-            req = _ur.Request(zip_url, headers={"User-Agent": "AI-Studio-Desktop"})
-            with _ur.urlopen(req, timeout=30) as resp, open(os.path.join(staging, "repo.zip"), "wb") as out:
-                total = 0
-                while True:
-                    if time.time() - t0 > 45:
-                        raise RuntimeError("下载超 45 秒未完成（zip 源被限速），换下一条路线")
-                    chunk = resp.read(256 * 1024)
-                    if not chunk:
-                        break
-                    total += len(chunk)
-                    if total > _UPDATE_ZIP_MAX:
-                        raise RuntimeError("更新包超过 %d MB，已中止" % (_UPDATE_ZIP_MAX // 1024 // 1024))
-                    out.write(chunk)
+            zip_target = os.path.join(staging, "repo.zip")
+            if _CURL_EXE:
+                _curl_fetch(zip_url, zip_target, 45, retries=1)   # 45s：慢滴直接放弃换路线
+            else:
+                t0 = time.time()
+                req = _ur.Request(zip_url, headers={"User-Agent": "AI-Studio-Desktop"})
+                with _ur.urlopen(req, timeout=30) as resp, open(zip_target, "wb") as out:
+                    total = 0
+                    while True:
+                        if time.time() - t0 > 45:
+                            raise RuntimeError("下载超 45 秒未完成（zip 源被限速），换下一条路线")
+                        chunk = resp.read(256 * 1024)
+                        if not chunk:
+                            break
+                        total += len(chunk)
+                        if total > _UPDATE_ZIP_MAX:
+                            raise RuntimeError("更新包超过 %d MB，已中止" % (_UPDATE_ZIP_MAX // 1024 // 1024))
+                        out.write(chunk)
         except Exception as exc:
             last_err = "zip 下载失败（%s）：%s" % (zip_url.split("/")[2], exc)
             _reset_staging()
