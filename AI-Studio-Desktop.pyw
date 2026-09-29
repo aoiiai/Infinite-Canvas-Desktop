@@ -3261,6 +3261,7 @@ def update_line_get() -> dict:
     return {"ok": True, "line": line, "label": _line_by_id(line)["label"],
             "lines": [dict(ln) for ln in _UPDATE_LINES],
             "proxy": str(_proxy_cache.get("proxy") or ""),
+            "proxy_source": str(_proxy_cache.get("source") or ""),
             "proxy_tested": bool(_proxy_cache.get("tested"))}
 
 
@@ -3269,15 +3270,17 @@ def update_line_set(line: str) -> dict:
         return {"ok": False, "error": "未知的下载线路：%s" % line}
     _write_update_config({"line": str(line)})
     return update_line_get()
+
+
+# —— 代理探测（只信"官方来源"，不再瞎扫端口：2026-09-29 见 _detect_proxy 的注释）——
 _PROXY_CANDIDATE_PORTS = (7890, 7891, 7897, 7899, 10808, 10809, 1080, 20171, 20172, 2080, 8888, 8080)
 _PROXY_PROBE_BUDGET = 20                  # 代理探测总预算（秒）；超了就用手上已找到的
-_OUR_PORTS = {3000, 3001, 3002, 3003, 3004, 3005, 8317, 8188}
-_proxy_cache = {"tested": False, "proxy": ""}
+_proxy_cache = {"tested": False, "proxy": "", "source": ""}
 
 def set_update_proxy(proxy: str) -> None:
     """update_source.json 里显式配了 proxy 就用它（覆盖自动探测）。"""
     if proxy:
-        _proxy_cache.update(tested=True, proxy=proxy)
+        _proxy_cache.update(tested=True, proxy=proxy, source="update_source.json 配置")
 
 
 def _env_proxy_candidates() -> list:
@@ -3326,53 +3329,21 @@ def _system_proxy_candidates() -> list:
     return out
 
 
-def _listening_local_ports() -> list:
-    """netstat 里**本机在监听**的端口（127.0.0.1 / 0.0.0.0 / [::1] / [::] 都算）。
-    ⚠ 2026-09-29 实测教训：写死的候选表里没有 6382，而用户代理就在 6382
-    ⇒ 探测全落空、退回最慢的镜像（ghfast.top 59KB/s），用户报「更新速度慢得离谱」。
-    ⚠ 另一个坑：netstat 输出是 GBK，`text=True` 按 UTF-8 解码会炸掉读取线程、stdout 恒为空
-    ⇒ 必须 `encoding="utf-8", errors="replace"`（只从里面抠 ASCII 的端口号）。"""
-    ports = []
-    try:
-        rc = subprocess.run(["netstat", "-ano"], capture_output=True, text=True,
-                            encoding="utf-8", errors="replace",
-                            timeout=12, creationflags=_NO_WINDOW)
-        for line in (rc.stdout or "").splitlines():
-            if "LISTENING" not in line:
-                continue
-            parts = line.split()
-            if len(parts) < 2:
-                continue
-            host, _, port_s = parts[1].rpartition(":")
-            if host.strip("[]") not in ("127.0.0.1", "0.0.0.0", "::1", "::"):
-                continue
-            try:
-                port = int(port_s)
-            except ValueError:
-                continue
-            if port in _OUR_PORTS or port in ports:
-                continue
-            ports.append(port)
-    except Exception:
-        pass
-    return ports
-
-
-def _probe_one_proxy(cand: str) -> bool:
-    """一个候选代理能不能用：6 秒内过 gstatic 的 204 探针才算。"""
+def _probe_one_proxy(cand: str, seconds: float = 5.0) -> bool:
+    """一个候选代理能不能用：seconds 秒内过 gstatic 的 204 探针才算。"""
     try:
         rc = subprocess.run(
-            [_CURL_EXE, "-sS", "-x", cand, "-m", "5", "-o", os.devnull, "-w", "%{http_code}",
-             "https://www.gstatic.com/generate_204"],
+            [_CURL_EXE, "-sS", "-x", cand, "-m", "%.1f" % seconds, "-o", os.devnull,
+             "-w", "%{http_code}", "https://www.gstatic.com/generate_204"],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=13, creationflags=_NO_WINDOW)
+            timeout=seconds + 8, creationflags=_NO_WINDOW)
         return rc.returncode == 0 and "204" in (rc.stdout or "")
     except Exception:
         return False
 
 
-def _race_probe(cands: list, timeout: float = None) -> str:
-    """并发探针，谁先过 204 就用谁（整体耗时 ≈ 单个探针的超时，不随候选数变长）。
+def _race_probe(cands: list, timeout: float = None, probe_seconds: float = 5.0) -> str:
+    """并发探针，谁先过 204 就用谁。**所有探针都回报了就收工**（不硬等满预算）。
     用 daemon 线程而不是 ThreadPoolExecutor：后者的 atexit 会 join 线程，退出应用时被拖几秒。"""
     if not cands:
         return ""
@@ -3381,66 +3352,73 @@ def _race_probe(cands: list, timeout: float = None) -> str:
 
     def _one(c):
         try:
-            res_q.put(c if _probe_one_proxy(c) else None)
+            res_q.put(c if _probe_one_proxy(c, probe_seconds) else None)
         except Exception:
             res_q.put(None)
 
     for c in cands:
         threading.Thread(target=_one, args=(c,), daemon=True).start()
     deadline = time.time() + (timeout or _PROXY_PROBE_BUDGET)
-    while True:
+    got = 0
+    while got < len(cands):
         left = deadline - time.time()
         if left <= 0:
-            return ""
+            break
         try:
-            got = res_q.get(timeout=min(0.5, left))
+            r = res_q.get(timeout=min(0.5, left))
         except Exception:
             continue
-        if got:
-            return got
+        got += 1
+        if r:
+            return r
+    return ""
 
 
 def _detect_proxy() -> str:
-    """**自动检索**用户正在用的代理（用户不用手配）：显式配置 > 环境变量 > Windows 系统代理 >
-    常见端口 + netstat 里本机在监听的端口。先按 HTTP 代理并发探（6 秒内过 204 才算），
-    一个都没找到，再对同一批端口按 SOCKS5 探一轮（clash 之类只开 SOCKS 口的情况）。
+    """**自动检索**用户正在用的代理（用户不用手配）：只信"官方来源" ——
+      ① 环境变量（HTTP(S)_PROXY / ALL_PROXY）
+      ② Windows 系统代理（注册表，跟 Edge 读同一处）
+      ③ 常见代理端口（7890/7891/10809…）
+    ① ② 先探（这就是浏览器会用的那个），探不通再看 ③；都不行就**不走代理**（跟浏览器一样）。
+    ⚠ 2026-09-29 教训：原来还会"扫 netstat 里所有本机在监听的端口、谁先应答用谁"，
+    结果在用户没开系统代理时挑中了 **WorkBuddy 沙箱自己的代理进程**（sandbox-cli.exe 的
+    13891/1750），既不是用户的代理、又会随沙箱退出而失效 ⇒ 已撤掉这个瞎猜的兜底。
     进程内缓存；start_helper 起了预热线程，用户点检查更新时通常已经探完。"""
     if _proxy_cache["tested"]:
         return _proxy_cache["proxy"]
-    found = ""
+    found, src = "", ""
     if _CURL_EXE:
-        local_ports = _listening_local_ports()
-        # ① 先只探"用户明确配过的"（环境变量 + Windows 系统代理）—— 这是浏览器会用的那个，
-        #    必须优先，否则"谁先应答用谁"可能挑中另一个碰巧也能当代理的本地端口（实测挑到过 1750）。
+        # ① 环境变量 ② 系统代理（注册表）—— 这两个是"用户明确配过"的，优先（并发探）
         explicit = []
-        for c in _env_proxy_candidates() + _system_proxy_candidates():
-            if c not in explicit:
-                explicit.append(c)
-        if explicit:
-            found = _race_probe(explicit)
-        # ② 没有显式配置（或它探不通）→ 常见端口 + netstat 里本机在监听的端口，并发探
+        for c in _env_proxy_candidates():
+            explicit.append(("环境变量", c))
+        for c in _system_proxy_candidates():
+            explicit.append(("Windows 系统代理", c))
+        seen, uniq = set(), []
+        for tag, c in explicit:
+            if c not in seen:
+                seen.add(c)
+                uniq.append((tag, c))
+        if uniq:
+            win = _race_probe([c for _, c in uniq])
+            if win:
+                found = win
+                src = next(t for t, c in uniq if c == win)
+        # ③ 常见代理端口（只在前面都没有时猜一次；猜测轮用 3 秒短超时，别把预算耗光）
         if not found:
-            http_cands = ["http://127.0.0.1:%d" % p for p in _PROXY_CANDIDATE_PORTS]
-            http_cands += ["http://127.0.0.1:%d" % p for p in local_ports]
-            seen, uniq = set(), []
-            for c in http_cands:
-                if c not in seen:
-                    seen.add(c)
-                    uniq.append(c)
-            found = _race_probe(uniq)
-        # ③ HTTP 代理都没有 → 同批端口再按 SOCKS5 试一轮
+            win = _race_probe(["http://127.0.0.1:%d" % p for p in _PROXY_CANDIDATE_PORTS],
+                              probe_seconds=3.0)
+            if win:
+                found, src = win, "常见代理端口"
+        # ④ HTTP 代理都没有 → 常见端口再按 SOCKS5 试一轮
         if not found:
-            socks = ["socks5h://127.0.0.1:%d" % p for p in
-                     list(_PROXY_CANDIDATE_PORTS) + local_ports]
-            seen2, uniq2 = set(), []
-            for c in socks:
-                if c not in seen2:
-                    seen2.add(c)
-                    uniq2.append(c)
-            found = _race_probe(uniq2)
-    _proxy_cache.update(tested=True, proxy=found)
+            win = _race_probe(["socks5h://127.0.0.1:%d" % p for p in _PROXY_CANDIDATE_PORTS],
+                              probe_seconds=3.0)
+            if win:
+                found, src = win, "常见代理端口(SOCKS5)"
+    _proxy_cache.update(tested=True, proxy=found, source=src)
     if found:
-        log("更新下载走本机代理 %s" % found)
+        log("更新下载走本机代理 %s（来源：%s）" % (found, src))
     return found
 
 def _fmt_speed(bps: float) -> str:

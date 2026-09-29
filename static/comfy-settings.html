@@ -372,9 +372,16 @@
                 var px = $('ulProxy');
                 if (!px) return;
                 if (d && d.proxy_tested) {
-                    px.innerHTML = d.proxy
-                        ? '已自动认出本机代理：<b>' + esc(d.proxy) + '</b>（所有线路都会走它，与上面选的线路无关）'
-                        : '没探到可用的本机代理 —— 会直接走上面选的线路（不经过代理）。';
+                    if (d.proxy) {
+                        px.innerHTML = '已自动认出本机代理：<b>' + esc(d.proxy) + '</b>'
+                            + (d.proxy_source ? '（来源：' + esc(d.proxy_source) + '）' : '')
+                            + ' —— 所有线路都会走它，与上面选的线路无关。';
+                    } else {
+                        px.innerHTML = '没探到本机代理（Windows 系统代理是关的、也没配代理环境变量）'
+                            + ' —— 会直接走上面选的线路。想固定用某个代理，可以在 '
+                            + '<code>AI-Studio-Data\\update_source.json</code> 里加 '
+                            + '<code>"proxy": "http://127.0.0.1:端口"</code>。';
+                    }
                     return;
                 }
                 px.textContent = '正在自动检索本机代理…';
