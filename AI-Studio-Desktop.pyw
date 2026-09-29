@@ -4168,7 +4168,6 @@ def profile_procs():
              "Get-CimInstance Win32_Process -Filter \"Name='msedge.exe'\" | "
              "Where-Object { $_.CommandLine -like '*%s*' } | "
              "ForEach-Object { $_.ProcessId.ToString() + '|' + $_.CommandLine }" % PROFILE_MARKER],
-            creationflags=_NO_WINDOW,
             capture_output=True, text=True, errors="replace", timeout=25,
             creationflags=CREATE_NO_WINDOW,
         )
