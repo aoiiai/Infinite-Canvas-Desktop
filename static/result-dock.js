@@ -74,9 +74,12 @@ html.studio-theme-dark .rd-btn:hover { border-color: rgba(96, 165, 250, 0.6); co
     display: flex; align-items: flex-start; justify-content: space-between; gap: 12px;
     padding: 12px 14px; border: 1px solid rgba(0, 0, 0, 0.06); border-radius: 16px;
     cursor: pointer; transition: background 0.16s ease;
+    /* 结果栏窄的时候（左栏只有 150~200px）按钮会挤掉标题 ⇒ 允许换行，
+       否则标题被压成一字一行（2026-09-29 截图里实测到） */
+    flex-wrap: wrap;
 }
 .rd-rec:hover { background: rgba(0, 0, 0, 0.02); }
-.rd-rec-main { min-width: 0; flex: 1; }
+.rd-rec-main { min-width: 0; flex: 1 1 140px; }
 .rd-rec-title { font-size: 13px; font-weight: 700; color: #111827;
     overflow: hidden; text-overflow: ellipsis; }
 .rd-rec-meta { display: flex; flex-wrap: wrap; gap: 4px 10px; margin-top: 4px;
@@ -242,6 +245,40 @@ video.rd-nopip::-webkit-media-controls-picture-in-picture-button { display: none
 
     let dockHost = null;      // 当前挂载点（灯箱要拿它找列表里的视频，见 openLightbox）
 
+    // 下载用的文件名：优先 ?filename=，其次路径末段，兜底 result（用户 2026-09-29 要「下载」按钮）
+    function downloadName(url, kind) {
+        const fallback = 'result' + (kind === 'video' ? '.mp4' : '.png');
+        let u = String(url || '');
+        if (!u || /^(data|blob):/i.test(u)) return fallback;      // data:/blob: 推不出名字
+        let name = '';
+        try {
+            const m = /[?&]filename=([^&]+)/.exec(u);
+            if (m) name = decodeURIComponent(m[1]);
+        } catch (e) { }
+        if (!name) {
+            try { name = u.split('?')[0].split('#')[0].split('/').pop() || ''; } catch (e) { }
+        }
+        // 去掉文件名里不能用的字符，并限长（别让整段 URL 变成文件名）
+        name = String(name).replace(/[\\/:*?"<>|\s]+/g, '_').slice(-80);
+        if (!name || name.indexOf('.') < 0) name = (name || 'result') + (kind === 'video' ? '.mp4' : '.png');
+        return name;
+    }
+
+    // 默认「下载」：同源用 <a download> 直接存盘；跨域时 download 会被忽略，退回新标签打开
+    function defaultDownload(url, kind) {
+        try {
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = downloadName(url, kind);
+            a.rel = 'noopener';
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+        } catch (e) {
+            try { window.open(url, '_blank'); } catch (e2) { }
+        }
+    }
+
     function mount(opts) {
         opts = opts || {};
         const host = typeof opts.host === 'string' ? document.querySelector(opts.host) : opts.host;
@@ -356,8 +393,11 @@ video.rd-nopip::-webkit-media-controls-picture-in-picture-button { display: none
                 //   工作流的提示词是整段模板文本，压在封面上又长又乱）
                 const foot = document.createElement('div');
                 foot.className = 'rd-foot';
+                // 按钮顺序按用户 2026-09-29 说的：放大 / 回填 / 下载
                 foot.innerHTML = '<button type="button" class="rd-btn" data-act="zoom">放大</button>'
-                    + (opts.onUse ? '<button type="button" class="rd-btn" data-act="use">回填</button>' : '');
+                    + (opts.onUse ? '<button type="button" class="rd-btn" data-act="use">回填</button>' : '')
+                    + (opts.onDownload === false
+                        ? '' : '<button type="button" class="rd-btn" data-act="download">下载</button>');
                 card.appendChild(foot);
                 card.addEventListener('click', function (e) {
                     const act = e.target && e.target.getAttribute ? e.target.getAttribute('data-act') : null;
@@ -369,6 +409,12 @@ video.rd-nopip::-webkit-media-controls-picture-in-picture-button { display: none
                     if (act === 'use') {           // 「回填」别顺带把播放也触发了
                         e.stopPropagation();
                         if (opts.onUse) opts.onUse(rec, item);
+                        return;
+                    }
+                    if (act === 'download') {      // 「下载」：页面没给 onDownload 就走默认存盘
+                        e.stopPropagation();
+                        if (typeof opts.onDownload === 'function') opts.onDownload(m.url, item, m.kind);
+                        else defaultDownload(m.url, m.kind);
                         return;
                     }
                     if (m.kind === 'video') togglePlay(el);
