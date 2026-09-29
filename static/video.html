@@ -664,6 +664,10 @@
             height: 100%;
             object-fit: cover;
             display: block;
+            /* 图片自己不许当拖拽源（2026-09-29）：<img> 默认 draggable，浏览器会把图当成
+               "拖文件"——排序时拖到提示词框外（侧栏/其它页）会被外壳的"拖文件转发"当成新参考图
+               重复添加，拖出窗口还会把图当文件打开。让 dragstart 只从 .thumb 这个 div 发起。 */
+            -webkit-user-drag: none;
         }
 
         /* iOS 那种"让出空位"的落点占位 */
@@ -724,10 +728,14 @@
             opacity: 1;
         }
 
-        /* 拖动排序时的反馈：原图直接隐藏（iOS 里图标被"拿走"的感觉），
-           被拿走的那张由跟着鼠标的 .thumb-ghost 体现，落点由空位块表示。
-           用 visibility 而不是 display，位置还占着，序号和落点计算都不会乱 */
-        .thumb.dragging { visibility: hidden; }
+        /* 拖动排序时的反馈：被拎起来的那张由跟着鼠标的 .thumb-ghost 体现，落点由空位块表示。
+           ⚠ 这里**只能压暗，绝不能用 visibility:hidden**（2026-09-29 实测，见下）：
+           dragstart 里给源缩略图加 .dragging，元素当场变不可见 ⇒ Chromium 认为拖拽源没了、
+           **立刻取消整个拖拽会话**（dragend 紧接着就触发，dragover/drop 一个都不来）
+           ⇒ 看着像"能拖起来、松手什么都不发生"（用户 2026-09-29 报「无法拖动改变顺序」）。
+           CDP Input.dispatchMouseEvent（真实输入管线）A/B 实测：源元素保持可见时
+           占位块/drop/重排全部正常；换成 visibility:hidden 则只有 dragstart + dragend。 */
+        .thumb.dragging { opacity: 0.28; }
 
         /* 拖拽时跟着鼠标的那张图（浏览器只会在 dragstart 时拍一张快照）。
            比原图大一圈 + 重投影 = iOS 里图标被"拎起来"的感觉 */
@@ -9042,6 +9050,7 @@
                 const img = document.createElement('img');
                 img.src = it.url;
                 img.alt = '';
+                img.draggable = false;      // 拖拽源只能是外层 .thumb（见 .thumb img 的注释）
                 img.onclick = () => openThumbPreview(it.url);
                 d.appendChild(img);
 
