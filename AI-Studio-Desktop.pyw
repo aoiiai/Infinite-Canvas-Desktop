@@ -3434,16 +3434,36 @@ def _fmt_speed(bps: float) -> str:
     return "%.0f B/s" % max(0.0, bps)
 
 
+# —— 代理只对"不套镜像"的线路生效（用户 2026-09-29 明确要求）——
+# 国内镜像站本身就在国内，套一层代理只会更慢甚至不通；只有直连 github.com 时才需要代理
+# （这也是浏览器的行为：系统代理是给"直连"用的）。
+_DIRECT_GITHUB_HOSTS = ("github.com", "api.github.com", "codeload.github.com",
+                        "uploads.github.com", "objects.githubusercontent.com",
+                        "raw.githubusercontent.com", "gist.githubusercontent.com")
+
+
+def _url_is_direct_github(url: str) -> bool:
+    """这个下载/探测地址是不是"直连 GitHub"（= 该走代理的那类）。镜像地址返回 False。"""
+    try:
+        host = url.split("//", 1)[1].split("/", 1)[0].split(":")[0].strip().lower()
+    except Exception:
+        return False
+    return host in _DIRECT_GITHUB_HOSTS
+
+
 def _probe_line_speed(url: str, seconds: float = 2.5) -> float:
     """短测一条线路：下 seconds 秒，返回实测字节/秒（0 = 不通/拿不到）。
+    ⚠ 代理只给"直连 GitHub"那条加；镜像线路**不套代理**（用户 2026-09-29 定：
+    选了镜像就走镜像）。否则测速和下载都被代理污染，比出来的速度也不是真实可比。
     ⚠ curl 超时退出的 rc 是 28，但 -w 的 speed_download 照样会打出来 ⇒ 只看 stdout，别判 rc。"""
     if not _CURL_EXE:
         return 0.0
     cmd = [_CURL_EXE, "-sS", "-L", "-m", "%.1f" % seconds, "-o", os.devnull,
            "-A", "AI-Studio-Desktop", "-w", "%{speed_download}", url]
-    proxy = _detect_proxy()
-    if proxy:
-        cmd += ["-x", proxy]
+    if _url_is_direct_github(url):
+        proxy = _detect_proxy()
+        if proxy:
+            cmd += ["-x", proxy]
     try:
         rc = subprocess.run(cmd, capture_output=True, text=True,
                             encoding="utf-8", errors="replace",
@@ -3500,15 +3520,18 @@ def _set_apply(stage: str, msg: str = "", pct: int = 0,
 def _curl_fetch(url: str, target: str, max_seconds: int, retries: int = 1) -> None:
     """用系统 curl 下载到 target。失败抛异常（带 stderr 尾行）。
     ⚠ 必须带 CREATE_NO_WINDOW：curl 是控制台程序，从无窗口的 pythonw 启动会弹黑色 CMD 窗
-    （2026-09-29 用户反馈「不要弹 cmd 窗，就后台下载」）。"""
+    （2026-09-29 用户反馈「不要弹 cmd 窗，就后台下载」）。
+    ⚠ 代理规则同下载：只有直连 GitHub 的地址才走代理（镜像/CDN 不套），
+    直连且没探到代理 = 真直连（用户 2026-09-29 定）。"""
     if not _CURL_EXE:
         raise RuntimeError("系统里没有 curl.exe")
     cmd = [_CURL_EXE, "-sS", "-L", "--retry", str(retries), "--retry-delay", "2",
            "--retry-all-errors", "-m", str(max_seconds), "-A", "AI-Studio-Desktop",
            "--max-filesize", str(_UPDATE_ZIP_MAX), "-o", target, url]
-    proxy = _detect_proxy()
-    if proxy:
-        cmd += ["-x", proxy]
+    if _url_is_direct_github(url):
+        proxy = _detect_proxy()
+        if proxy:
+            cmd += ["-x", proxy]
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=max_seconds + 30,
                           creationflags=_NO_WINDOW)
     if proc.returncode != 0:
@@ -3517,15 +3540,17 @@ def _curl_fetch(url: str, target: str, max_seconds: int, retries: int = 1) -> No
 
 def _curl_download_progress(url: str, target: str, max_seconds: int, total: int, on_pct) -> None:
     """带进度回调的下载：Popen 启动 curl（无窗口），轮询落盘字节数算百分比 + **实时速度**。
-    total 来自 Release 资产元数据（字节）；on_pct(0~100, 字节/秒)。超时/非零退出抛异常。"""
+    total 来自 Release 资产元数据（字节）；on_pct(0~100, 字节/秒)。超时/非零退出抛异常。
+    ⚠ 代理只给"直连 GitHub"那条加；镜像线路不套代理（用户 2026-09-29 定：选了镜像就走镜像）。"""
     if not _CURL_EXE:
         raise RuntimeError("系统里没有 curl.exe")
     cmd = [_CURL_EXE, "-sS", "-L", "--retry", "2", "--retry-delay", "2",
            "--retry-all-errors", "-m", str(max_seconds), "-A", "AI-Studio-Desktop",
            "--max-filesize", str(_UPDATE_ZIP_MAX), "-o", target, url]
-    proxy = _detect_proxy()
-    if proxy:
-        cmd += ["-x", proxy]
+    if _url_is_direct_github(url):
+        proxy = _detect_proxy()
+        if proxy:
+            cmd += ["-x", proxy]
     proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                             creationflags=_NO_WINDOW)
     deadline = time.time() + max_seconds
