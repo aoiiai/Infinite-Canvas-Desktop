@@ -67,6 +67,22 @@
         .missing { margin:0 0 0 2px; padding-left:16px; font-size:11.5px; line-height:1.7; color:var(--muted); }
         .missing code { font-family:ui-monospace,Menlo,monospace; font-size:11px; }
         .wf { font-size:12px; font-weight:800; margin-top:8px; color:var(--text); }
+        /* 更新下载线路（2026-09-29）：国内镜像要标出来，选完即生效 */
+        .line-list { display:flex; flex-direction:column; gap:6px; }
+        .line-opt { display:flex; align-items:center; gap:8px; padding:7px 10px; border:1px solid var(--line);
+                    border-radius:10px; font-size:12px; font-weight:700; color:var(--muted); cursor:pointer;
+                    transition:border-color .15s ease, background .15s ease, color .15s ease; }
+        .line-opt:hover { border-color:var(--faint); background:var(--soft); }
+        .line-opt.on { border-color:var(--text); color:var(--text); background:var(--soft); }
+        .line-opt input { margin:0; accent-color:#2563eb; }
+        .line-opt .host { margin-left:auto; font-family:ui-monospace,Menlo,monospace; font-size:10.5px;
+                          color:var(--faint); font-weight:600; text-align:right; }
+        .line-opt .tag { font-size:10px; font-weight:900; padding:1px 7px; border-radius:999px;
+                         background:rgba(100,116,139,.16); color:var(--muted); white-space:nowrap; }
+        .line-opt .tag.cn { background:rgba(22,163,74,.14); color:#15803d; }
+        html.studio-theme-dark .line-opt .tag.cn { background:rgba(74,222,128,.16); color:#4ade80; }
+        .line-opt .tag.rec { background:rgba(37,99,235,.14); color:#2563eb; }
+        html.studio-theme-dark .line-opt .tag.rec { background:rgba(96,165,250,.18); color:#93c5fd; }
     </style>
 </head>
 <body>
@@ -108,6 +124,16 @@
                 <section class="card">
                     <div class="card-title">当前生效</div>
                     <div id="cpInfo" class="kv"><span>读取中…</span></div>
+                </section>
+
+                <section class="card">
+                    <div class="card-title">更新下载线路</div>
+                    <div id="ulList" class="line-list"><div class="tip">读取中…</div></div>
+                    <div id="ulStatus" class="status-line"></div>
+                    <div class="tip">「一键更新」下载更新包时走哪条线路。<b>国内镜像</b>是在 GitHub 前面套一层
+                        加速站，通常比直连快很多（同一时刻实测能差几十倍）；「自动测速择优」会先把每条
+                        各测 2.5 秒、挑实测最快的那条再下。选完立刻生效（下一次下载就用它），
+                        下载时进度条上会显示当前线路和实时速度。</div>
                 </section>
             </div>
         </div>
@@ -331,6 +357,52 @@
             };
 
             refresh();
+
+            // ---------- 更新下载线路（2026-09-29）----------
+            // 存 AI-Studio-Data\update_source.json 的 line 键；助手 GET/POST /update-line。
+            function renderLines(d) {
+                var box = $('ulList');
+                if (!box) return;
+                var lines = (d && d.lines) || [];
+                if (!lines.length) {
+                    box.innerHTML = '<div class="tip">拿不到线路表（助手版本太旧？）</div>';
+                    return;
+                }
+                box.innerHTML = lines.map(function (ln) {
+                    var on = (ln.id === d.line);
+                    var tagCls = 'tag' + (ln.cn ? ' cn' : (ln.id === 'auto' ? ' rec' : ''));
+                    return '<label class="line-opt' + (on ? ' on' : '') + '">'
+                        + '<input type="radio" name="upLine" value="' + esc(ln.id) + '"'
+                        + (on ? ' checked' : '') + '>'
+                        + '<span>' + esc(ln.label) + '</span>'
+                        + (ln.tag ? '<span class="' + tagCls + '">' + esc(ln.tag) + '</span>' : '')
+                        + '<span class="host">' + esc(ln.host || '') + '</span></label>';
+                }).join('');
+                Array.prototype.forEach.call(box.querySelectorAll('input[name="upLine"]'), function (r) {
+                    r.addEventListener('change', function () { saveLine(r.value); });
+                });
+            }
+
+            function saveLine(line) {
+                var st = $('ulStatus');
+                if (st) st.textContent = '保存中…';
+                hj('/update-line', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ line: line })
+                }).then(function (d) {
+                    renderLines(d);
+                    if (st) st.innerHTML = '已保存：<b>' + esc(d.label || line) + '</b>';
+                }).catch(function (e) {
+                    if (st) st.innerHTML = '<span class="bad">' + esc((e && e.message) || e) + '</span>';
+                });
+            }
+
+            hj('/update-line').then(renderLines).catch(function () {
+                var box = $('ulList');
+                if (box) box.innerHTML = '<div class="tip">连不上本地助手服务（桌面版才有这项）。</div>';
+            });
+
             // 点过启动之后短时轮询，让「运行中」及时亮起来
             setInterval(function () {
                 if (startedAt && Date.now() - startedAt < 120000) refresh();

@@ -3186,9 +3186,71 @@ _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 
 
 # —— 下载线路（2026-09-29 用户：GitHub 直连慢，接入国内镜像 + 自动探测本机代理）——
 # 镜像站套在原始 GitHub URL 前面即可加速 release/raw 下载；镜像站经常换，直连永远压轴兜底。
-_GH_MIRRORS = ("https://ghfast.top/", "https://gh-proxy.com/", "https://ghproxy.net/",
-               "https://github.moeyy.xyz/")
-_PROXY_CANDIDATE_PORTS = (7890, 7897, 7899, 10808, 10809, 1080, 20171)
+# 2026-09-29 第二批（用户：更新慢得离谱 + 要在 ComfyUI 设置里选线路）：实测 ghfast.top 只有
+# 59KB/s 而 gh-proxy.com 4.6MB/s，原来"哪条通走哪条"⇒ 默认选中了最慢的 ⇒ 改成先测速择优，
+# 并且把线路表暴露给设置页让用户自己钉一条（国内镜像标出来）。
+_UPDATE_LINES = (
+    {"id": "auto", "label": "自动测速择优", "tag": "推荐", "cn": False, "prefix": "",
+     "host": "各线路先测 2.5 秒再下"},
+    {"id": "ghfast", "label": "ghfast.top", "tag": "国内镜像", "cn": True,
+     "prefix": "https://ghfast.top/", "host": "ghfast.top"},
+    {"id": "ghproxy", "label": "gh-proxy.com", "tag": "国内镜像", "cn": True,
+     "prefix": "https://gh-proxy.com/", "host": "gh-proxy.com"},
+    {"id": "ghproxynet", "label": "ghproxy.net", "tag": "国内镜像", "cn": True,
+     "prefix": "https://ghproxy.net/", "host": "ghproxy.net"},
+    {"id": "moeyy", "label": "github.moeyy.xyz", "tag": "国内镜像", "cn": True,
+     "prefix": "https://github.moeyy.xyz/", "host": "github.moeyy.xyz"},
+    {"id": "direct", "label": "GitHub 直连", "tag": "不加速", "cn": False, "prefix": "",
+     "host": "github.com"},
+)
+_GH_MIRRORS = tuple(ln["prefix"] for ln in _UPDATE_LINES if ln["prefix"])
+
+
+def _line_by_id(line_id: str) -> dict:
+    for ln in _UPDATE_LINES:
+        if ln["id"] == line_id:
+            return ln
+    return _UPDATE_LINES[0]
+
+
+def _read_update_config() -> dict:
+    """读 AI-Studio-Data\\update_source.json（读不到就当空配置，别抛）。"""
+    try:
+        with open(os.path.join(state_dir(), _UPDATE_CONFIG_FILE), "r", encoding="utf-8") as fh:
+            cfg = json.load(fh)
+        return cfg if isinstance(cfg, dict) else {}
+    except Exception:
+        return {}
+
+
+def _write_update_config(patch: dict) -> dict:
+    """合并写回（保住 version_url 等其它键），先写临时文件再 replace。"""
+    cfg = _read_update_config()
+    cfg.update(patch)
+    path = os.path.join(state_dir(), _UPDATE_CONFIG_FILE)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(cfg, fh, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+    return cfg
+
+
+def update_line_get() -> dict:
+    line = str(_read_update_config().get("line") or "auto").strip() or "auto"
+    if line not in [ln["id"] for ln in _UPDATE_LINES]:
+        line = "auto"
+    return {"ok": True, "line": line, "label": _line_by_id(line)["label"],
+            "lines": [dict(ln) for ln in _UPDATE_LINES]}
+
+
+def update_line_set(line: str) -> dict:
+    if str(line) not in [ln["id"] for ln in _UPDATE_LINES]:
+        return {"ok": False, "error": "未知的下载线路：%s" % line}
+    _write_update_config({"line": str(line)})
+    return update_line_get()
+_PROXY_CANDIDATE_PORTS = (7890, 7891, 7897, 7899, 10808, 10809, 1080, 20171, 20172, 2080, 8888, 8080)
+_PROXY_PROBE_BUDGET = 20                  # 代理探测总预算（秒）；超了就用手上已找到的
+_OUR_PORTS = {3000, 3001, 3002, 3003, 3004, 3005, 8317, 8188}
 _proxy_cache = {"tested": False, "proxy": ""}
 
 def set_update_proxy(proxy: str) -> None:
@@ -3196,29 +3258,172 @@ def set_update_proxy(proxy: str) -> None:
     if proxy:
         _proxy_cache.update(tested=True, proxy=proxy)
 
+
+def _system_proxy_candidates() -> list:
+    """Windows 系统代理设置里的地址（用户开了"系统代理"时这里最准）。"""
+    out = []
+    if os.name != "nt":
+        return out
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r"Software\Microsoft\Windows\CurrentVersion\Internet Settings") as k:
+            enabled, _ = winreg.QueryValueEx(k, "ProxyEnable")
+            server, _ = winreg.QueryValueEx(k, "ProxyServer")
+        if enabled and server:
+            for part in str(server).split(";"):
+                part = part.strip()
+                if "=" in part:                       # 形如 http=127.0.0.1:6382
+                    part = part.split("=", 1)[1].strip()
+                if part:
+                    out.append(part if "://" in part else "http://" + part)
+    except Exception:
+        pass
+    return out
+
+
+def _listening_localhost_ports() -> list:
+    """netstat 里 127.0.0.1 上**真在监听**的端口（用户代理换端口也能自动找到）。
+    ⚠ 2026-09-29 实测教训：写死的候选表里没有 6382，而用户代理就在 6382
+    ⇒ 探测全落空、退回最慢的镜像（ghfast.top 59KB/s），用户报「更新速度慢得离谱」。"""
+    ports = []
+    try:
+        rc = subprocess.run(["netstat", "-ano"], capture_output=True, text=True,
+                            encoding="utf-8", errors="replace",
+                            timeout=12, creationflags=_NO_WINDOW)
+        for line in (rc.stdout or "").splitlines():
+            if "LISTENING" not in line:
+                continue
+            parts = line.split()
+            if len(parts) < 2 or not parts[1].startswith("127.0.0.1:"):
+                continue
+            try:
+                port = int(parts[1].rsplit(":", 1)[1])
+            except ValueError:
+                continue
+            if port in _OUR_PORTS or port in ports:
+                continue
+            ports.append(port)
+    except Exception:
+        pass
+    return ports
+
+
+def _probe_one_proxy(cand: str) -> bool:
+    """一个候选代理能不能用：6 秒内过 gstatic 的 204 探针才算。"""
+    try:
+        rc = subprocess.run(
+            [_CURL_EXE, "-sS", "-x", cand, "-m", "5", "-o", os.devnull, "-w", "%{http_code}",
+             "https://www.gstatic.com/generate_204"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=13, creationflags=_NO_WINDOW)
+        return rc.returncode == 0 and "204" in (rc.stdout or "")
+    except Exception:
+        return False
+
+
 def _detect_proxy() -> str:
-    """找可用代理：显式配置 > 常见本地端口探测（6 秒内能过 204 探针才算）> 无。
+    """找可用代理：显式配置 > Windows 系统代理 > 常见端口 + netstat 里真在监听的本地端口（**并发**探针）> 无。
     进程内缓存；start_helper 起了预热线程，用户点检查更新时通常已经探完。"""
     if _proxy_cache["tested"]:
         return _proxy_cache["proxy"]
     found = ""
     if _CURL_EXE:
-        for port in _PROXY_CANDIDATE_PORTS:
-            try:
-                rc = subprocess.run(
-                    [_CURL_EXE, "-sS", "-x", "http://127.0.0.1:%d" % port, "-m", "6",
-                     "-o", os.devnull, "-w", "%{http_code}",
-                     "https://www.gstatic.com/generate_204"],
-                    capture_output=True, text=True, timeout=12, creationflags=_NO_WINDOW)
-                if rc.returncode == 0 and "204" in (rc.stdout or ""):
-                    found = "http://127.0.0.1:%d" % port
-                    break
-            except Exception:
-                continue
+        cands = list(_system_proxy_candidates())
+        cands += ["http://127.0.0.1:%d" % p for p in _PROXY_CANDIDATE_PORTS]
+        cands += ["http://127.0.0.1:%d" % p for p in _listening_localhost_ports()]
+        seen, uniq = set(), []
+        for c in cands:
+            if c not in seen:
+                seen.add(c)
+                uniq.append(c)
+        try:
+            import concurrent.futures as _cf
+            with _cf.ThreadPoolExecutor(max_workers=12) as ex:
+                futs = {ex.submit(_probe_one_proxy, c): c for c in uniq}
+                try:
+                    for fut in _cf.as_completed(futs, timeout=_PROXY_PROBE_BUDGET):
+                        if fut.cancelled():
+                            continue
+                        try:
+                            ok = fut.result()
+                        except Exception:
+                            ok = False
+                        if ok:
+                            found = futs[fut]
+                            break
+                except Exception:
+                    pass
+                for f in futs:                       # 找到了就把剩下的撤掉
+                    f.cancel()
+        except Exception:
+            pass
     _proxy_cache.update(tested=True, proxy=found)
     if found:
         log("更新下载走本机代理 %s" % found)
     return found
+
+def _fmt_speed(bps: float) -> str:
+    """给进度条用的速度文字。"""
+    try:
+        bps = float(bps or 0)
+    except Exception:
+        bps = 0.0
+    if bps >= 1048576:
+        return "%.1f MB/s" % (bps / 1048576.0)
+    if bps >= 1024:
+        return "%.0f KB/s" % (bps / 1024.0)
+    return "%.0f B/s" % max(0.0, bps)
+
+
+def _probe_line_speed(url: str, seconds: float = 2.5) -> float:
+    """短测一条线路：下 seconds 秒，返回实测字节/秒（0 = 不通/拿不到）。
+    ⚠ curl 超时退出的 rc 是 28，但 -w 的 speed_download 照样会打出来 ⇒ 只看 stdout，别判 rc。"""
+    if not _CURL_EXE:
+        return 0.0
+    cmd = [_CURL_EXE, "-sS", "-L", "-m", "%.1f" % seconds, "-o", os.devnull,
+           "-A", "AI-Studio-Desktop", "-w", "%{speed_download}", url]
+    proxy = _detect_proxy()
+    if proxy:
+        cmd += ["-x", proxy]
+    try:
+        rc = subprocess.run(cmd, capture_output=True, text=True,
+                            encoding="utf-8", errors="replace",
+                            timeout=seconds + 15, creationflags=_NO_WINDOW)
+        out = (rc.stdout or "").strip()
+        return float(out.splitlines()[-1]) if out else 0.0
+    except Exception:
+        return 0.0
+
+
+def _order_lines(candidates: list, seconds: float = 2.5) -> list:
+    """按**实测速度**从快到慢排线路（并发测，整体 ≈ seconds 秒）。
+    2026-09-29 实测：ghfast.top 59KB/s、gh-proxy.com 4.6MB/s、ghproxy.net 11KB/s、
+    github.moeyy.xyz 不通；而原来"哪条通走哪条"恰好选中列表第一个 ghfast.top
+    ⇒ 36MB 要等 10 分钟（用户原话「更新速度慢得离谱」）。"""
+    if not candidates:
+        return []
+    if len(candidates) == 1:
+        return list(candidates)
+    scored = {}
+    try:
+        import concurrent.futures as _cf
+        with _cf.ThreadPoolExecutor(max_workers=min(6, len(candidates))) as ex:
+            futs = {ex.submit(_probe_line_speed, cu, seconds): cu for cu in candidates}
+            for fut, cu in futs.items():
+                try:
+                    scored[cu] = fut.result()
+                except Exception:
+                    scored[cu] = 0.0
+    except Exception:
+        return list(candidates)
+    for cu in candidates:
+        try:
+            log("线路测速 %s：%s" % (cu.split("/")[2], _fmt_speed(scored.get(cu, 0.0))))
+        except Exception:
+            pass
+    return sorted(candidates, key=lambda cu: -scored.get(cu, 0.0))
+
 
 _apply_state = {"running": False, "stage": "", "msg": "", "pct": 0,
                 "done": False, "ok": None, "result": None}
@@ -3253,8 +3458,8 @@ def _curl_fetch(url: str, target: str, max_seconds: int, retries: int = 1) -> No
         raise RuntimeError("curl rc=%s %s" % (proc.returncode, tail[-1] if tail else ""))
 
 def _curl_download_progress(url: str, target: str, max_seconds: int, total: int, on_pct) -> None:
-    """带进度回调的下载：Popen 启动 curl（无窗口），轮询落盘字节数算百分比。
-    total 来自 Release 资产元数据（字节）；on_pct(0~100)。超时/非零退出抛异常。"""
+    """带进度回调的下载：Popen 启动 curl（无窗口），轮询落盘字节数算百分比 + **实时速度**。
+    total 来自 Release 资产元数据（字节）；on_pct(0~100, 字节/秒)。超时/非零退出抛异常。"""
     if not _CURL_EXE:
         raise RuntimeError("系统里没有 curl.exe")
     cmd = [_CURL_EXE, "-sS", "-L", "--retry", "2", "--retry-delay", "2",
@@ -3266,6 +3471,8 @@ def _curl_download_progress(url: str, target: str, max_seconds: int, total: int,
     proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                             creationflags=_NO_WINDOW)
     deadline = time.time() + max_seconds
+    speed = 0.0                 # 平滑后的字节/秒（用户 2026-09-29 要能看到下载速度）
+    last_b, last_t = 0, time.time()
     try:
         while proc.poll() is None:
             if time.time() > deadline:
@@ -3275,7 +3482,12 @@ def _curl_download_progress(url: str, target: str, max_seconds: int, total: int,
                 done = os.path.getsize(target)
             except OSError:
                 done = 0
-            on_pct(min(99, int(done * 100 / total)) if total > 0 else 0)
+            now = time.time()
+            if now - last_t >= 0.8:                      # 每 ~0.8s 采一次瞬时速度
+                inst = (done - last_b) / (now - last_t)
+                speed = inst if speed <= 0 else (speed * 0.55 + inst * 0.45)
+                last_b, last_t = done, now
+            on_pct(min(99, int(done * 100 / total)) if total > 0 else 0, speed)
             time.sleep(0.4)
         if proc.returncode != 0:
             tail = ""
@@ -3285,7 +3497,7 @@ def _curl_download_progress(url: str, target: str, max_seconds: int, total: int,
             except Exception:
                 pass
             raise RuntimeError("curl rc=%s %s" % (proc.returncode, tail))
-        on_pct(100)
+        on_pct(100, speed)
     finally:
         try:
             proc.stderr.close()
@@ -3401,15 +3613,27 @@ def apply_update_worker(repo_id: str, owner: str, repo: str, zip_urls: list,
         # —— 路线 A（首选）：Release 资产，带下载进度条（总大小来自资产元数据）——
         try:
             zip_t = os.path.join(staging, "update.zip")
-            _set_apply("download", "正在下载更新包…", 0)
-            # 线路：国内镜像 ×4 → GitHub 直连。哪条通走哪条，进度条上标当前线路
-            candidates = [m + asset_url for m in _GH_MIRRORS] + [asset_url]
+            # 线路：用户在 ComfyUI 设置页钉的那条优先；auto（或没配）就**并发测速择优**。
+            # 2026-09-29 实测 ghfast.top 59KB/s vs gh-proxy.com 4.6MB/s —— 原来"哪条通走哪条"
+            # 恰好选中列表第一个最慢的 ⇒ 36MB 要等 10 分钟（用户报「更新速度慢得离谱」）。
+            all_lines = [m + asset_url for m in _GH_MIRRORS] + [asset_url]
+            line_id = str(_read_update_config().get("line") or "auto")
+            if line_id != "auto":
+                pinned = _line_by_id(line_id)
+                first = (pinned["prefix"] + asset_url) if pinned["prefix"] else asset_url
+                candidates = [first] + [c for c in all_lines if c != first]
+                _set_apply("download", "按设置走「%s」，正在下载更新包…" % pinned["label"], 0)
+            else:
+                _set_apply("download", "正在测速挑选最快线路…", 0)
+                candidates = _order_lines(all_lines)
             last = None
             for cu in candidates:
                 host = cu.split("/")[2]
                 try:
                     _curl_download_progress(cu, zip_t, 150, asset_total,
-                        lambda p, h=host: _set_apply("download", "正在下载更新包… %d%%（%s）" % (p, h), p))
+                        lambda p, sp=0, h=host: _set_apply(
+                            "download",
+                            "正在下载更新包… %d%% · %s（%s）" % (p, _fmt_speed(sp), h), p))
                     last = None
                     break
                 except Exception as exc:
@@ -3651,6 +3875,8 @@ class _HelperHandler(BaseHTTPRequestHandler):
             if path == "/settings":
                 cfg = save_comfy_config(self._body_json())
                 return self._json({"ok": True, "config": cfg, "report": comfy_report()})
+            if path == "/update-line":          # 更新下载线路（ComfyUI 设置页里选）
+                return self._json(update_line_set(str((self._body_json() or {}).get("line") or "")))
             if path == "/comfyui/start":
                 return self._json(comfy_start(force=bool(q.get("force"))))
             if path == "/input-file":
@@ -3730,6 +3956,8 @@ class _HelperHandler(BaseHTTPRequestHandler):
             if path == "/settings":
                 return self._json({"ok": True, "config": load_comfy_config(),
                                    "report": comfy_report()})
+            if path == "/update-line":          # 更新下载线路（ComfyUI 设置页里选）
+                return self._json(update_line_get())
             if path == "/lora-search":
                 return self._json(lora_search(q.get("q", ""), q.get("site", "civitai")))
             if path == "/comfyui/ping":
