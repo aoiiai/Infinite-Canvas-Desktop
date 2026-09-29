@@ -2540,7 +2540,22 @@
         // 只替换 main.py / VERSION / AI-Studio-Desktop.pyw / AI-Studio-Backend.py / static/**，
         // 更新前自动在 AI-Studio-Data\update_backups\ 留还原点，用户数据一律不碰。
         let updateConfirmLatest = "";
+        // 两个状态守卫（2026-09-29 用户报两个 bug 后加）：
+        //  updateBusy     = 已确认并开始更新（下载/解压/备份/替换期间）
+        //                   ⇒ 任何"检查更新"入口都不许再弹确认框
+        //  updateChecking = 检查请求在飞 ⇒ 防连点弹两次
+        let updateBusy = false;
+        let updateChecking = false;
+        function updateModalOpen() {
+            const box = document.getElementById('update-confirm-modal');
+            return !!box && !box.hidden;
+        }
         function openUpdateConfirm(latest, current) {
+            // ⚠ 已经在更新中 / 确认框已经开着 → 直接不弹。
+            //   否则会出现"确认之后又弹一次确认框"：实测启动后 8 秒的静默检查
+            //   runProjectUpdate(true) 会在你点完「立即更新」之后又把弹窗打回确认视图，
+            //   进度条被顶掉（用户 2026-09-29 报的 bug①）。
+            if (updateBusy || updateModalOpen()) return;
             updateConfirmLatest = String(latest || "");
             const box = document.getElementById('update-confirm-modal');
             const txt = document.getElementById('update-confirm-text');
@@ -2558,6 +2573,7 @@
             box.hidden = false;
         }
         function closeUpdateConfirm() {
+            if (updateBusy) return;      // 更新进行中不许关（按钮本来就藏了，这里再兜一层）
             const box = document.getElementById('update-confirm-modal');
             if (box) box.hidden = true;
             if (updateConfirmLatest) setPillPending(true);   // 用户取消 → pill 变绿色「一键更新」+ 红点
@@ -2572,6 +2588,10 @@
             const closeBtn = document.getElementById('update-progress-close');
             const xBtn = document.querySelector('#update-confirm-modal .studio-modal-close');
             if (!box || !body || !prog || !fill || !label) return;
+            // ⚠ 必须显式打开弹窗（2026-09-29 bug②）：绿 pill 直更时弹窗是关着的，
+            //   原来只改内部视图 ⇒ 屏幕上什么都没发生，用户以为"打不开确认框、无法更新"。
+            box.hidden = false;
+            updateBusy = true;               // 更新期间任何检查入口都不再弹确认框
             body.style.display = 'none';
             prog.style.display = 'block';
             fill.style.width = '0%';
@@ -2586,6 +2606,7 @@
                 });
                 const d = await res.json();
                 if (!d || !d.ok) {                       // 没配源/已是最新/已在进行中等
+                    updateBusy = false;                  // 没真正开始 → 允许重试
                     label.textContent = (d && d.error) || '无法开始更新';
                     closeBtn.hidden = false;
                     if (xBtn) xBtn.style.display = '';
@@ -2598,6 +2619,7 @@
                     fill.style.width = (s.pct || 0) + '%';
                     label.textContent = s.msg || '…';
                     if (s.done) {
+                        updateBusy = false;
                         fill.style.width = '100%';
                         const r2 = s.result || {};
                         if (s.ok) {
@@ -2612,6 +2634,7 @@
                     }
                 }
             } catch (e) {
+                updateBusy = false;
                 label.textContent = '更新失败：' + (e && e.message ? e.message : e);
                 closeBtn.hidden = false;
                 if (xBtn) xBtn.style.display = '';
@@ -2619,6 +2642,13 @@
         }
         async function runProjectUpdate(silent) {
             // silent=true：启动时的自动检查 —— 只有查到新版才弹窗，其余情况一律不出声
+            // ⚠ 先过三道"别打扰"的闸（2026-09-29 bug①）：正在更新 / 检查在飞 / 弹窗已开着
+            //   —— 否则启动 8 秒的这次静默检查会把用户刚确认的更新弹窗打回确认视图（进度条被顶掉）。
+            //   另外：用户已经看过并选了「取消」（updateConfirmLatest 有值）也不再弹，
+            //   想更新就点那颗已经变绿的「一键更新」。
+            if (updateBusy || updateChecking || updateModalOpen()) return;
+            if (silent && updateConfirmLatest) return;
+            updateChecking = true;
             try {
                 const res = await fetch(UPDATE_CHECK_HELPER + '/check-update', { cache: 'no-store' });
                 if (!res.ok) throw new Error('HTTP ' + res.status);
@@ -2627,7 +2657,11 @@
                 if (!d.configured) { if (!silent) updateCheckToast('当前版本 ' + (d.current || '?') + ' · 还没配更新源'); return; }
                 if (d.has_update) { openUpdateConfirm(d.latest, d.current); return; }
                 if (!silent) updateCheckToast('已是最新（' + (d.current || '?') + '）');
-            } catch (e) { if (!silent) updateCheckToast('检查失败：' + (e && e.message ? e.message : e)); }
+            } catch (e) {
+                if (!silent) updateCheckToast('检查失败：' + (e && e.message ? e.message : e));
+            } finally {
+                updateChecking = false;
+            }
         }
         setTimeout(function () { runProjectUpdate(true); }, 8000);   // 启动后 8 秒静默检查一次
 
@@ -2689,16 +2723,22 @@
         }
         async function checkAppUpdate() {
             const pill = document.getElementById('pillUpdate');
-            if (pill && pill.classList.contains('pending')) { applyUpdateNow(); return; }   // 待更新态：一键直更
-            async function helperAlive() {
-                try {
-                    const r = await fetch(UPDATE_CHECK_HELPER + '/health', { cache: 'no-store' });
-                    return !!(await r.json()).ok;
-                } catch (e) { return false; }
+            if (pill && pill.classList.contains('pending')) {          // 待更新态：一键直更
+                if (updateBusy) { updateCheckToast('更新正在进行中…'); return; }
+                applyUpdateNow();
+                return;
             }
-            if (!await helperAlive()) { updateCheckToast('助手服务没运行'); return; }
-            updateCheckToast('正在检查更新…');
+            if (updateChecking || updateBusy) return;                  // 防连点 / 更新中就别再检查了
+            updateChecking = true;
             try {
+                async function helperAlive() {
+                    try {
+                        const r = await fetch(UPDATE_CHECK_HELPER + '/health', { cache: 'no-store' });
+                        return !!(await r.json()).ok;
+                    } catch (e) { return false; }
+                }
+                if (!await helperAlive()) { updateCheckToast('助手服务没运行'); return; }
+                updateCheckToast('正在检查更新…');
                 const res = await fetch(UPDATE_CHECK_HELPER + '/check-update', { cache: 'no-store' });
                 if (!res.ok) throw new Error('HTTP ' + res.status);
                 const d = await res.json();
@@ -2706,7 +2746,11 @@
                 if (!d.configured) { updateCheckToast('当前版本 ' + (d.current || '?') + ' · 还没配更新源'); return; }
                 if (d.has_update) { openUpdateConfirm(d.latest, d.current); return; }
                 updateCheckToast('已是最新（' + (d.current || '?') + '）');
-            } catch (e) { updateCheckToast('检查失败：' + (e && e.message ? e.message : String(e))); }
+            } catch (e) {
+                updateCheckToast('检查失败：' + (e && e.message ? e.message : String(e)));
+            } finally {
+                updateChecking = false;
+            }
         }
 
         function computeConnectivitySources(results) {
