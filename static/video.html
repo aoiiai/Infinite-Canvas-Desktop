@@ -6728,6 +6728,12 @@
         // 切到本页时刷新一次历史
         window.addEventListener('message', (e) => {
             if (e.data?.type === 'studio-lang' || e.data?.type === 'canvas-focus') resultDockRefresh();
+            // 外壳转发来的拖放文件（2026-09-29）：外壳对 iframe 有缩放 transform，真实拖文件
+            // 时事件可能落在**外壳文档**上而不是 iframe 里 —— 外壳接到带 Files 的 drop 会把
+            // File 列表 postMessage 过来（File 可结构化克隆），这里统一走 addImageFiles。
+            if (e.data?.type === 'studio-dropped-files' && Array.isArray(e.data.files) && e.data.files.length) {
+                addImageFiles(e.data.files);
+            }
         });
 
         // ================= LoRA 库 =================
@@ -9326,6 +9332,27 @@
                     .map(i => i.getAsFile())
                     .filter(Boolean);
                 if (items.length) addImageFiles(items);
+            });
+
+            // ⚠ 文档级兜底（2026-09-29）：外壳对 iframe 做 UI 缩放（transform）后，Chromium 对
+            //   缩放 iframe 的拖放**命中测试会错位**（CDP Input.dispatchDragEvent 实测：真实
+            //   管线的拖放事件一个都没落到 iframe 文档里）。真实拖文件时 dragenter/drop 可能
+            //   落在 promptDrop 之外的元素上，上面 zone 的处理器收不到 ⇒ 在整个文档接管：
+            //   只要带 Files 的拖放落在页面任何位置，都按「添加参考图」处理。
+            //   zone 自己的处理器在落点正确时先跑并 stopPropagation，不会重复添加。
+            document.addEventListener('dragover', (e) => {
+                if (thumbReordering) return;
+                if (!isFileDrag(e)) return;
+                e.preventDefault();                     // 允许 drop 发生（否则浏览器显示禁止）
+            });
+            document.addEventListener('drop', (e) => {
+                if (thumbReordering) return;
+                if (!isFileDrag(e)) return;
+                e.preventDefault();
+                e.stopPropagation();
+                zone.classList.remove('drop-active');
+                const files = Array.from((e.dataTransfer && e.dataTransfer.files) || []);
+                if (files.length) addImageFiles(files);
             });
         })();
 

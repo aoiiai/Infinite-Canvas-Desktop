@@ -2631,6 +2631,30 @@
         }
         setTimeout(function () { runProjectUpdate(true); }, 8000);   // 启动后 8 秒静默检查一次
 
+        // 文件拖入转发（2026-09-29）：外壳对 iframe 有 UI 缩放 transform，Chromium 对缩放
+        // iframe 的拖放命中会错位 —— 拖进视频页的文件可能落在**外壳文档**上而不是 iframe 里。
+        // 外壳接到带 Files 的 drop 就转发给视频页（File 可结构化克隆过 postMessage），
+        // 视频页 addImageFiles 统一处理。仅在视频页处于激活态时转发，不劫持其它页面的拖放。
+        (function installShellFileDropForward() {
+            const isFileDrag = (e) => Array.from((e.dataTransfer && e.dataTransfer.types) || []).includes('Files');
+            document.addEventListener('dragover', (e) => {
+                if (!isFileDrag(e)) return;
+                const fv = document.getElementById('frame-video');
+                if (!fv || !fv.classList.contains('active')) return;
+                e.preventDefault();                     // 允许 drop 发生（否则浏览器显示禁止）
+            });
+            document.addEventListener('drop', (e) => {
+                if (!isFileDrag(e)) return;
+                const fv = document.getElementById('frame-video');
+                if (!fv || !fv.classList.contains('active')) return;
+                e.preventDefault();
+                const files = Array.from((e.dataTransfer && e.dataTransfer.files) || []);
+                if (files.length) {
+                    try { fv.contentWindow.postMessage({ type: 'studio-dropped-files', files: files }, '*'); } catch (err) { }
+                }
+            });
+        })();
+
         // ---------- 检查软件更新（2026-09-28 从视频页顶栏搬进侧栏）：助手 /check-update，结果用 toast 报 ----------
         // 更新源配置在 AI-Studio-Data\update_source.json 的 version_url（GitHub raw 的 VERSION 地址）；
         // 拉取与比较逻辑在助手的 check_update()。外壳页没有现成 toast，这里自带一个居中顶部的轻量 toast
