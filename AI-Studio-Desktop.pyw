@@ -1637,6 +1637,77 @@ def template_cats_action(body: dict) -> dict:
 # 注意不能用 _load_store：那套是为「JSON 数组」设计的（模板/历史），
 # 遇到字典会整个丢掉。这里单独读，只认字典。
 
+# —— 提示词框里导入的参考图：真字节落盘，刷新/重启后能恢复（用户 2026-09-29）——
+# 页面只存清单（顺序 + 文件名 + comfyName），字节放 AI-Studio-Data\ref_images\。
+_REF_IMG_DIR = "ref_images"
+
+
+def _ref_img_safe_name(name: str) -> str:
+    """参考图文件名：只留安全字符（路径分隔符/中文/空格一律换掉），限长 80。"""
+    base = os.path.basename(str(name or "")).strip()
+    base = re.sub(r"[^0-9A-Za-z._\-]", "_", base)[:80]
+    return "" if base in ("", ".", "..") else base
+
+
+def ref_image_save(name: str, data: bytes) -> dict:
+    safe = _ref_img_safe_name(name)
+    if not safe:
+        return {"ok": False, "error": "文件名不合法"}
+    if not data:
+        return {"ok": False, "error": "没有内容"}
+    d = os.path.join(state_dir(), _REF_IMG_DIR)
+    os.makedirs(d, exist_ok=True)
+    try:
+        with open(os.path.join(d, safe), "wb") as fh:
+            fh.write(data)
+    except OSError as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True, "name": safe, "size": len(data)}
+
+
+def ref_image_sync(keep) -> dict:
+    """按页面报的清单清理：用户删掉的图别一直堆在磁盘上。"""
+    d = os.path.join(state_dir(), _REF_IMG_DIR)
+    keep_set = set()
+    for k in (keep or []):
+        n = _ref_img_safe_name(k)
+        if n:
+            keep_set.add(n)
+    removed = []
+    try:
+        for fn in os.listdir(d):
+            if fn in keep_set:
+                continue
+            try:
+                os.remove(os.path.join(d, fn))
+                removed.append(fn)
+            except OSError:
+                pass
+    except FileNotFoundError:
+        pass
+    return {"ok": True, "removed": removed}
+
+
+def ref_image_read(name: str):
+    """返回 (bytes, ctype)；取不到返回 (None, '')。"""
+    safe = _ref_img_safe_name(name)
+    if not safe:
+        return None, ""
+    full = os.path.join(state_dir(), _REF_IMG_DIR, safe)
+    if not os.path.isfile(full):
+        return None, ""
+    try:
+        with open(full, "rb") as fh:
+            data = fh.read()
+    except OSError:
+        return None, ""
+    ext = os.path.splitext(safe)[1].lower()
+    ctype = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+             ".webp": "image/webp", ".gif": "image/gif", ".avif": "image/avif",
+             ".bmp": "image/bmp"}.get(ext, "application/octet-stream")
+    return data, ctype
+
+
 def list_ui_state() -> dict:
     path = _store_file(UI_STATE_FILE)
     if not os.path.isfile(path):
@@ -1670,6 +1741,36 @@ def _clean_ui_loras(raw) -> list:
     return out
 
 
+def _clean_ui_prompts(raw) -> dict:
+    """提示词草稿：**按工作流**分别存（用户 2026-09-29：刷新/重启别把最后写的提示词弄丢）。
+    按工作流分开存才不会串味 —— 切工作流时各看各的。"""
+    out = {}
+    if not isinstance(raw, dict):
+        return out
+    for k, v in list(raw.items())[:40]:
+        key = str(k or "").strip()[:120]
+        if not key:
+            continue
+        out[key] = str(v if v is not None else "")[:20000]
+    return out
+
+
+def _clean_ui_ref_images(raw) -> list:
+    """参考图清单（顺序 = 数组顺序；真字节在 ref_images\\ 里）。"""
+    out = []
+    if not isinstance(raw, list):
+        return out
+    for it in raw[:9]:
+        if not isinstance(it, dict):
+            continue
+        name = _ref_img_safe_name(it.get("file") or it.get("name") or "")
+        if not name:
+            continue
+        out.append({"file": name, "type": str(it.get("type") or "")[:60],
+                    "comfyName": str(it.get("comfyName") or "")[:200]})
+    return out
+
+
 def save_ui_state(body: dict) -> dict:
     """只认白名单字段，逐个覆盖；没带的字段保持原值。"""
     body = body or {}
@@ -1679,6 +1780,10 @@ def save_ui_state(body: dict) -> dict:
             cur[k] = body[k]
     if "loras" in body:
         cur["loras"] = _clean_ui_loras(body.get("loras"))
+    if "prompts" in body:
+        cur["prompts"] = _clean_ui_prompts(body.get("prompts"))
+    if "refImages" in body:
+        cur["refImages"] = _clean_ui_ref_images(body.get("refImages"))
     cur["updated"] = _now_text()
     _save_store(UI_STATE_FILE, cur)
     return {"ok": True, "state": cur}
@@ -4132,6 +4237,10 @@ class _HelperHandler(BaseHTTPRequestHandler):
                 return self._json(app_history_delete((self._body_json() or {}).get("timestamp")))
             if path == "/ui-state":
                 return self._json(save_ui_state(self._body_json()))
+            if path == "/ref-image":          # 参考图字节（raw body），配合 /ui-state 的 refImages 清单
+                return self._json(ref_image_save(q.get("name", ""), self._body_bytes()))
+            if path == "/ref-image-sync":     # 按清单清理磁盘上已删除的参考图
+                return self._json(ref_image_sync((self._body_json() or {}).get("keep") or []))
             if path == "/lora-triggers":
                 return self._json(lora_triggers_save(self._body_json()))
             if path == "/lora-fetch/start":
@@ -4206,6 +4315,11 @@ class _HelperHandler(BaseHTTPRequestHandler):
                 return self._json(res, 200 if res.get("ok") else 400)
             if path == "/cover":
                 return self._cover(q.get("id", ""))
+            if path == "/ref-image":          # 提示词框里的参考图（刷新/重启后恢复用）
+                data, ctype = ref_image_read(q.get("name", ""))
+                if data is None:
+                    return self._json({"error": "not found"}, 404)
+                return self._send(200, data, ctype, {"Cache-Control": "no-store"})
             if path == "/workflows":
                 return self._json({"workflows": list_workflow_files()})
             if path == "/workflow":

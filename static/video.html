@@ -6070,6 +6070,10 @@
         let uiStateLoras = null;       // /ui-state 里读回来的选择
         let loraStateApplied = false;  // 只套用一次（首次扫描后）
         let loraStateDirty = false;    // 用户已手动改过选择 → 不让存档盖回去
+        // 提示词草稿：**按工作流**分别存（用户 2026-09-29：刷新/重启别把最后写的提示词弄丢）
+        let uiStatePrompts = {};
+        // 参考图存档：读回来的清单（等页面初始化完再取图，见 restoreRefImages）
+        let uiStateRefImages = null;
 
         function readUiState() {
             return {
@@ -6081,6 +6085,14 @@
             };
         }
 
+        // 各工作流的提示词草稿（把当前工作流这份刷新成输入框里的内容）
+        function collectPrompts() {
+            const m = Object.assign({}, uiStatePrompts);
+            const ta = document.getElementById('prompt');
+            if (ta) m[currentWorkflow] = ta.value;
+            return m;
+        }
+
         function scheduleSaveUiState() {
             if (!helperOk) return;
             clearTimeout(uiStateTimer);
@@ -6090,7 +6102,10 @@
                     const body = currentWorkflow === MM_WORKFLOW
                         ? readUiState()
                         : { loras: selectedLoras.map(s => ({ rel: s.rel, name: s.name, strength: s.strength })) };
+                    body.prompts = collectPrompts();            // 提示词草稿（按工作流）
+                    body.refImages = promptImagesManifest();    // 参考图清单（顺序 + 文件名）
                     await helperPost('/ui-state', body);
+                    persistRefImages();                          // 字节落盘（不 await）
                 } catch (e) {}
             }, 600);
         }
@@ -6128,6 +6143,16 @@
                 }
                 // LoRA 选择先收着：等首次扫描完再套用（要用扫描结果补封面和 id）
                 if (Array.isArray(s.loras)) uiStateLoras = s.loras;
+                // 提示词草稿：套回当前工作流那一份（用户 2026-09-29：刷新/重启后最后写的提示词还在）
+                if (s.prompts && typeof s.prompts === 'object') {
+                    uiStatePrompts = s.prompts;
+                    const draft = uiStatePrompts[currentWorkflow];
+                    if (typeof draft === 'string' && draft.trim()) {
+                        document.getElementById('prompt').value = draft;
+                    }
+                }
+                // 参考图清单先收着：等页面初始化完再取图（restoreRefImages，图要走网络）
+                if (Array.isArray(s.refImages) && s.refImages.length) uiStateRefImages = s.refImages;
                 syncSlider('megapixels', 'mpFill', 'megapixelsNum');
                 syncSlider('duration', 'durFill', 'durationNum');
                 syncOptsSummary();
@@ -6515,6 +6540,8 @@
         document.getElementById('duration').addEventListener('input', scheduleSaveUiState);
         document.getElementById('durationNum').addEventListener('change', scheduleSaveUiState);
         document.getElementById('seed').addEventListener('change', scheduleSaveUiState);
+        // 提示词草稿：边写边存（600ms 防抖在 scheduleSaveUiState 里），刷新/重启后自动回来
+        document.getElementById('prompt').addEventListener('input', scheduleSaveUiState);
         // 非 MM 工作流：这四个值按「工作流 + 字段」另存一份（不改 ui_state，MM 的记忆不受影响）
         document.getElementById('aspectRatio').addEventListener('change', panelValueChanged);
         document.getElementById('megapixels').addEventListener('input', panelValueChanged);
@@ -9152,6 +9179,7 @@
             to = Math.max(0, Math.min(promptImages.length, to));
             promptImages.splice(to, 0, moved);
             syncThumbOrder();             // 就地挪节点 + 改序号（不重建 ⇒ 松手即到位）
+            scheduleSaveUiState();        // 顺序也存（刷新后顺序不变）
         }
 
         // 监听挂在整行上，而不是单个缩略图上。
@@ -9238,11 +9266,73 @@
                 }
                 promptImages.push({
                     id: 'img_' + Math.random().toString(36).slice(2),
-                    file: f, url: URL.createObjectURL(f), comfyName: null
+                    file: f, url: URL.createObjectURL(f), comfyName: null,
+                    persistName: refPersistName(f)      // 加进来就分配存档名（清单要立刻带上它）
                 });
                 added++;
             }
-            if (added) renderThumbs();
+            if (added) { renderThumbs(); scheduleSaveUiState(); }
+        }
+
+        // ---------- 参考图持久化（用户 2026-09-29：刷新/重启别把导入的图弄丢） ----------
+        // 真字节交给助手存进 AI-Studio-Data\ref_images\，页面只记文件名 + comfyName。
+        function refPersistName(file) {
+            const ext = (String((file && file.name) || '').match(/\.[a-z0-9]+$/i) || ['.png'])[0].toLowerCase();
+            return 'ref_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 7) + ext;
+        }
+
+        function promptImagesManifest() {
+            return promptImages.map(it => ({
+                file: it.persistName || '',
+                type: (it.file && it.file.type) || '',
+                comfyName: it.comfyName || ''
+            })).filter(x => x.file);
+        }
+
+        // 还没落盘的传上去 + 让助手清掉已删除的旧文件（不 await：图大，别拖住参数保存）
+        async function persistRefImages() {
+            if (!helperOk) return;
+            const keep = [];
+            for (const it of promptImages) {
+                if (!it.persistName) it.persistName = refPersistName(it.file);
+                keep.push(it.persistName);
+                if (it.persisted || !it.file || !it.file.arrayBuffer) continue;
+                try {
+                    const buf = await it.file.arrayBuffer();
+                    const r = await fetch(HELPER_BASE + '/ref-image?name=' + encodeURIComponent(it.persistName),
+                        { method: 'POST', body: buf });
+                    const d = await r.json().catch(() => ({}));
+                    if (r.ok && d && d.ok) it.persisted = true;
+                } catch (e) { }
+            }
+            try {
+                await fetch(HELPER_BASE + '/ref-image-sync', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ keep: keep })
+                });
+            } catch (e) { }
+        }
+
+        // 刷新/重启后按存档顺序把参考图取回来
+        async function restoreRefImages(list) {
+            if (!Array.isArray(list) || !list.length || !helperOk) return;
+            for (const it of list) {
+                if (promptImages.length >= MAX_REF) break;
+                const name = String((it && it.file) || '');
+                if (!name) continue;
+                try {
+                    const r = await fetch(HELPER_BASE + '/ref-image?name=' + encodeURIComponent(name));
+                    if (!r.ok) continue;
+                    const blob = await r.blob();
+                    const f = new File([blob], name, { type: (it.type || blob.type || 'image/png') });
+                    promptImages.push({
+                        id: 'img_' + Math.random().toString(36).slice(2), file: f,
+                        url: URL.createObjectURL(f), comfyName: it.comfyName || null,
+                        persistName: name, persisted: true
+                    });
+                } catch (e) { }
+            }
+            if (promptImages.length) renderThumbs();
         }
 
         function removeThumb(id) {
@@ -9251,6 +9341,7 @@
             try { URL.revokeObjectURL(promptImages[i].url); } catch (e) { }
             promptImages.splice(i, 1);
             renderThumbs();
+            scheduleSaveUiState();
         }
 
         function openThumbPreview(url) {
@@ -12330,7 +12421,8 @@
             syncOptsSummary();
             applyLoraCardSize();        // 恢复上次的卡片尺寸档位
             restoreLoraViewState();     // 恢复上次的库浏览位置（文件夹/搜索/排序/目录展开/滚动）
-            await restoreUiState();     // 恢复上次的参数（比例/清晰度/时长/种子）
+            await restoreUiState();     // 恢复上次的参数（比例/清晰度/时长/种子 + 提示词草稿）
+            if (uiStateRefImages) restoreRefImages(uiStateRefImages);   // 参考图（走网络，不 await）
             renderLoraChips();
             renderLoraSelected();
             updateMdlBtn();
