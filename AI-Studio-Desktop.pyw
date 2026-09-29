@@ -4919,10 +4919,20 @@ def wait_window_gone() -> None:
 
     app_fully_closed() 返回 None 表示这次查询没成功 —— 只当"未知"跳过，
     绝不当成"窗口没了"，否则一次 WMI 抖动就会把还在用的应用误杀。
+
+    顺带做"旧代码自愈"（2026-09-29）：每轮都看一眼磁盘上的启动器是不是比本进程新
+    （= 刚更新完、本进程还是旧代码），是就自己安排一次重启。
+    ⚠ 为什么必须有这道保险：执行更新的永远是"正在跑的那个助手" ⇒ 更新完那一瞬间
+    跑的仍是旧代码，如果旧代码里没有自动重启逻辑，就只能靠用户手动关窗重开。
+    启动后本进程的启动时刻 > 磁盘 mtime，所以重启完不会再触发（不会来回重启）。
     """
     confirms = 0
     while True:
         time.sleep(POLL)
+        if helper_code_stale():
+            log("检测到程序已更新（磁盘代码比本进程新），自动重启应用…")
+            if _spawn_auto_restart():
+                return          # 收尾脚本负责：关窗口 → 收掉本进程 → 重新拉起
         state = app_fully_closed()
         if state is None:
             continue
