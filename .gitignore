@@ -32,3 +32,4 @@ static/js/i18n(1)/
 # ==== 敏感/本地专属（用户 2026-09-29 指定不入库）====
 API/
 workflows/
+_publish_release.py
