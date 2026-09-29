@@ -197,6 +197,10 @@ video.rd-nopip::-webkit-media-controls-picture-in-picture-button { display: none
         //   （UI 缩放），而 transform 会成为 `position:fixed` 的**包含块** ⇒ 灯箱不再相对视口定位、
         //   变成跟着 body 走：页面一滚动灯箱就往上跑、底部露出页面（用户 2026-09-28 报
         //   「打开图片不会置顶」）。`<html>` 上没有 transform，挂这儿才是真的铺满视口。
+        // ⚠ z-index 必须顶格：历史/素材库等弹窗（.editor-overlay）会被页面的动态层叠管理器抬到
+        //   140+，而 CSS 里写死 z-index:100 ⇒ 从弹窗里开灯箱会被压在弹窗**下面**（用户
+        //   2026-09-29 报「打开都不会出现在界面顶层」）。给顶格值，任何弹窗都压不住它。
+        box.style.zIndex = '2147483000';
         document.documentElement.appendChild(box);
         lightboxEl = box;
         if (kind !== 'image') {
