@@ -3200,7 +3200,7 @@ _UPDATE_LINES = (
      "prefix": "https://ghproxy.net/", "host": "ghproxy.net"},
     {"id": "moeyy", "label": "github.moeyy.xyz", "tag": "国内镜像", "cn": True,
      "prefix": "https://github.moeyy.xyz/", "host": "github.moeyy.xyz"},
-    {"id": "direct", "label": "GitHub 直连", "tag": "不加速", "cn": False, "prefix": "",
+    {"id": "direct", "label": "GitHub 直连", "tag": "不套镜像", "cn": False, "prefix": "",
      "host": "github.com"},
 )
 _GH_MIRRORS = tuple(ln["prefix"] for ln in _UPDATE_LINES if ln["prefix"])
@@ -3239,8 +3239,15 @@ def update_line_get() -> dict:
     line = str(_read_update_config().get("line") or "auto").strip() or "auto"
     if line not in [ln["id"] for ln in _UPDATE_LINES]:
         line = "auto"
+    # 顺带把"自动检索到的本机代理"报给设置页显示（不在这里同步探，只读预热线程的结果，
+    # 免得设置页打开时被 20 秒的探针卡住）。万一预热线程还没跑（或还没跑完），这里补一脚，
+    # 前端会隔几秒再问一次。
+    if not _proxy_cache.get("tested") and _CURL_EXE:
+        threading.Thread(target=_detect_proxy, daemon=True).start()
     return {"ok": True, "line": line, "label": _line_by_id(line)["label"],
-            "lines": [dict(ln) for ln in _UPDATE_LINES]}
+            "lines": [dict(ln) for ln in _UPDATE_LINES],
+            "proxy": str(_proxy_cache.get("proxy") or ""),
+            "proxy_tested": bool(_proxy_cache.get("tested"))}
 
 
 def update_line_set(line: str) -> dict:
@@ -3259,8 +3266,24 @@ def set_update_proxy(proxy: str) -> None:
         _proxy_cache.update(tested=True, proxy=proxy)
 
 
+def _env_proxy_candidates() -> list:
+    """环境变量里配的代理（有些代理软件会顺手设 HTTP_PROXY/ALL_PROXY）。"""
+    out = []
+    for key in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy",
+                "ALL_PROXY", "all_proxy"):
+        v = str(os.environ.get(key) or "").strip()
+        if not v:
+            continue
+        if "://" not in v:
+            v = "http://" + v
+        if v not in out:
+            out.append(v)
+    return out
+
+
 def _system_proxy_candidates() -> list:
-    """Windows 系统代理设置里的地址（用户开了"系统代理"时这里最准）。"""
+    """Windows 系统代理设置里的地址（用户开了"系统代理"时这里最准）。
+    形如 `http=127.0.0.1:6382;socks=127.0.0.1:7891` —— socks 那条要换成 socks5h:// 才探得通。"""
     out = []
     if os.name != "nt":
         return out
@@ -3273,19 +3296,28 @@ def _system_proxy_candidates() -> list:
         if enabled and server:
             for part in str(server).split(";"):
                 part = part.strip()
-                if "=" in part:                       # 形如 http=127.0.0.1:6382
-                    part = part.split("=", 1)[1].strip()
-                if part:
-                    out.append(part if "://" in part else "http://" + part)
+                if not part:
+                    continue
+                scheme = "http"
+                if "=" in part:
+                    name, _, val = part.partition("=")
+                    part = val.strip()
+                    if "socks" in name.lower():
+                        scheme = "socks5h"
+                if not part:
+                    continue
+                out.append(part if "://" in part else "%s://%s" % (scheme, part))
     except Exception:
         pass
     return out
 
 
-def _listening_localhost_ports() -> list:
-    """netstat 里 127.0.0.1 上**真在监听**的端口（用户代理换端口也能自动找到）。
+def _listening_local_ports() -> list:
+    """netstat 里**本机在监听**的端口（127.0.0.1 / 0.0.0.0 / [::1] / [::] 都算）。
     ⚠ 2026-09-29 实测教训：写死的候选表里没有 6382，而用户代理就在 6382
-    ⇒ 探测全落空、退回最慢的镜像（ghfast.top 59KB/s），用户报「更新速度慢得离谱」。"""
+    ⇒ 探测全落空、退回最慢的镜像（ghfast.top 59KB/s），用户报「更新速度慢得离谱」。
+    ⚠ 另一个坑：netstat 输出是 GBK，`text=True` 按 UTF-8 解码会炸掉读取线程、stdout 恒为空
+    ⇒ 必须 `encoding="utf-8", errors="replace"`（只从里面抠 ASCII 的端口号）。"""
     ports = []
     try:
         rc = subprocess.run(["netstat", "-ano"], capture_output=True, text=True,
@@ -3295,10 +3327,13 @@ def _listening_localhost_ports() -> list:
             if "LISTENING" not in line:
                 continue
             parts = line.split()
-            if len(parts) < 2 or not parts[1].startswith("127.0.0.1:"):
+            if len(parts) < 2:
+                continue
+            host, _, port_s = parts[1].rpartition(":")
+            if host.strip("[]") not in ("127.0.0.1", "0.0.0.0", "::1", "::"):
                 continue
             try:
-                port = int(parts[1].rsplit(":", 1)[1])
+                port = int(port_s)
             except ValueError:
                 continue
             if port in _OUR_PORTS or port in ports:
@@ -3322,42 +3357,63 @@ def _probe_one_proxy(cand: str) -> bool:
         return False
 
 
+def _race_probe(cands: list, timeout: float = None) -> str:
+    """并发探针，谁先过 204 就用谁（整体耗时 ≈ 单个探针的超时，不随候选数变长）。
+    用 daemon 线程而不是 ThreadPoolExecutor：后者的 atexit 会 join 线程，退出应用时被拖几秒。"""
+    if not cands:
+        return ""
+    import queue as _q
+    res_q = _q.Queue()
+
+    def _one(c):
+        try:
+            res_q.put(c if _probe_one_proxy(c) else None)
+        except Exception:
+            res_q.put(None)
+
+    for c in cands:
+        threading.Thread(target=_one, args=(c,), daemon=True).start()
+    deadline = time.time() + (timeout or _PROXY_PROBE_BUDGET)
+    while True:
+        left = deadline - time.time()
+        if left <= 0:
+            return ""
+        try:
+            got = res_q.get(timeout=min(0.5, left))
+        except Exception:
+            continue
+        if got:
+            return got
+
+
 def _detect_proxy() -> str:
-    """找可用代理：显式配置 > Windows 系统代理 > 常见端口 + netstat 里真在监听的本地端口（**并发**探针）> 无。
+    """**自动检索**用户正在用的代理（用户不用手配）：显式配置 > 环境变量 > Windows 系统代理 >
+    常见端口 + netstat 里本机在监听的端口。先按 HTTP 代理并发探（6 秒内过 204 才算），
+    一个都没找到，再对同一批端口按 SOCKS5 探一轮（clash 之类只开 SOCKS 口的情况）。
     进程内缓存；start_helper 起了预热线程，用户点检查更新时通常已经探完。"""
     if _proxy_cache["tested"]:
         return _proxy_cache["proxy"]
     found = ""
     if _CURL_EXE:
-        cands = list(_system_proxy_candidates())
-        cands += ["http://127.0.0.1:%d" % p for p in _PROXY_CANDIDATE_PORTS]
-        cands += ["http://127.0.0.1:%d" % p for p in _listening_localhost_ports()]
+        local_ports = _listening_local_ports()
+        http_cands = _env_proxy_candidates() + _system_proxy_candidates()
+        http_cands += ["http://127.0.0.1:%d" % p for p in _PROXY_CANDIDATE_PORTS]
+        http_cands += ["http://127.0.0.1:%d" % p for p in local_ports]
         seen, uniq = set(), []
-        for c in cands:
+        for c in http_cands:
             if c not in seen:
                 seen.add(c)
                 uniq.append(c)
-        try:
-            import concurrent.futures as _cf
-            with _cf.ThreadPoolExecutor(max_workers=12) as ex:
-                futs = {ex.submit(_probe_one_proxy, c): c for c in uniq}
-                try:
-                    for fut in _cf.as_completed(futs, timeout=_PROXY_PROBE_BUDGET):
-                        if fut.cancelled():
-                            continue
-                        try:
-                            ok = fut.result()
-                        except Exception:
-                            ok = False
-                        if ok:
-                            found = futs[fut]
-                            break
-                except Exception:
-                    pass
-                for f in futs:                       # 找到了就把剩下的撤掉
-                    f.cancel()
-        except Exception:
-            pass
+        found = _race_probe(uniq)
+        if not found:                       # HTTP 代理都没有 → 同批端口再按 SOCKS5 试
+            socks = ["socks5h://127.0.0.1:%d" % p for p in
+                     list(_PROXY_CANDIDATE_PORTS) + local_ports]
+            seen2, uniq2 = set(), []
+            for c in socks:
+                if c not in seen2:
+                    seen2.add(c)
+                    uniq2.append(c)
+            found = _race_probe(uniq2)
     _proxy_cache.update(tested=True, proxy=found)
     if found:
         log("更新下载走本机代理 %s" % found)
