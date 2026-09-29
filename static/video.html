@@ -1648,7 +1648,9 @@
 
         .dock {
             position: absolute;
-            top: 6px;              /* 和卡片顶边对齐（卡片里有 p-1.5） */
+            top: 0;                /* 和主卡片**外边缘**齐平（2026-09-29 用户：上边缘差 6px 不对齐）。
+                                      原来写 top:6px 想对齐"卡片内层内容"（卡片有 p-1.5），但结果栏
+                                      自己也是一个同样的 console-card ⇒ 两张卡片的上边缘反而差 6px。 */
             width: 300px;          /* syncDockFit() 会按实测空白再收紧/放宽 */
             display: flex;
             flex-direction: column;
