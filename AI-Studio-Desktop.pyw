@@ -3309,16 +3309,23 @@ def apply_update(force: bool = False) -> dict:
         shutil.rmtree(staging, ignore_errors=True)
         return {"ok": False, "error": "拉取 release 信息失败：%s" % exc}
     tag = str(meta.get("tag_name") or "").strip()
+    # 资产选择（2026-09-29 起 Release 只发完整包）：优先 Infinite-Canvas-Desktop-*-full.zip，
+    # 兼容旧的 update.zip。补丁本就是"当版全量白名单快照"而非差异，拉最新完整包不会漏内容。
     asset_url = ""
     asset_total = 0
     for a in (meta.get("assets") or []):
-        if str(a.get("name") or "") == "update.zip":
+        name = str(a.get("name") or "")
+        if name.startswith("Infinite-Canvas-Desktop-") and name.endswith("-full.zip"):
+            asset_url = str(a.get("browser_download_url") or "")
+            asset_total = int(a.get("size") or 0)
+            break
+        if name == "update.zip" and not asset_url:
             asset_url = str(a.get("browser_download_url") or "")
             asset_total = int(a.get("size") or 0)
     latest = tag.lstrip("vV").strip()
     if not asset_url:
         shutil.rmtree(staging, ignore_errors=True)
-        return {"ok": False, "error": "release 缺 update.zip 资产"}
+        return {"ok": False, "error": "release 缺可更新的包资产（*-full.zip）"}
     if not force and not _ver_newer(latest, cur):
         shutil.rmtree(staging, ignore_errors=True)
         return {"ok": False, "current": cur, "latest": latest,
