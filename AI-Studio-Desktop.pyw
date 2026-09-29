@@ -3184,6 +3184,42 @@ _CURL_EXE = shutil.which("curl")         # Win10+ 自带。2026-09-29 实测：�
 
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
 
+# —— 下载线路（2026-09-29 用户：GitHub 直连慢，接入国内镜像 + 自动探测本机代理）——
+# 镜像站套在原始 GitHub URL 前面即可加速 release/raw 下载；镜像站经常换，直连永远压轴兜底。
+_GH_MIRRORS = ("https://ghfast.top/", "https://gh-proxy.com/", "https://ghproxy.net/",
+               "https://github.moeyy.xyz/")
+_PROXY_CANDIDATE_PORTS = (7890, 7897, 7899, 10808, 10809, 1080, 20171)
+_proxy_cache = {"tested": False, "proxy": ""}
+
+def set_update_proxy(proxy: str) -> None:
+    """update_source.json 里显式配了 proxy 就用它（覆盖自动探测）。"""
+    if proxy:
+        _proxy_cache.update(tested=True, proxy=proxy)
+
+def _detect_proxy() -> str:
+    """找可用代理：显式配置 > 常见本地端口探测（6 秒内能过 204 探针才算）> 无。
+    进程内缓存；start_helper 起了预热线程，用户点检查更新时通常已经探完。"""
+    if _proxy_cache["tested"]:
+        return _proxy_cache["proxy"]
+    found = ""
+    if _CURL_EXE:
+        for port in _PROXY_CANDIDATE_PORTS:
+            try:
+                rc = subprocess.run(
+                    [_CURL_EXE, "-sS", "-x", "http://127.0.0.1:%d" % port, "-m", "6",
+                     "-o", os.devnull, "-w", "%{http_code}",
+                     "https://www.gstatic.com/generate_204"],
+                    capture_output=True, text=True, timeout=12, creationflags=_NO_WINDOW)
+                if rc.returncode == 0 and "204" in (rc.stdout or ""):
+                    found = "http://127.0.0.1:%d" % port
+                    break
+            except Exception:
+                continue
+    _proxy_cache.update(tested=True, proxy=found)
+    if found:
+        log("更新下载走本机代理 %s" % found)
+    return found
+
 _apply_state = {"running": False, "stage": "", "msg": "", "pct": 0,
                 "done": False, "ok": None, "result": None}
 
@@ -3207,6 +3243,9 @@ def _curl_fetch(url: str, target: str, max_seconds: int, retries: int = 1) -> No
     cmd = [_CURL_EXE, "-sS", "-L", "--retry", str(retries), "--retry-delay", "2",
            "--retry-all-errors", "-m", str(max_seconds), "-A", "AI-Studio-Desktop",
            "--max-filesize", str(_UPDATE_ZIP_MAX), "-o", target, url]
+    proxy = _detect_proxy()
+    if proxy:
+        cmd += ["-x", proxy]
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=max_seconds + 30,
                           creationflags=_NO_WINDOW)
     if proc.returncode != 0:
@@ -3221,6 +3260,9 @@ def _curl_download_progress(url: str, target: str, max_seconds: int, total: int,
     cmd = [_CURL_EXE, "-sS", "-L", "--retry", "2", "--retry-delay", "2",
            "--retry-all-errors", "-m", str(max_seconds), "-A", "AI-Studio-Desktop",
            "--max-filesize", str(_UPDATE_ZIP_MAX), "-o", target, url]
+    proxy = _detect_proxy()
+    if proxy:
+        cmd += ["-x", proxy]
     proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                             creationflags=_NO_WINDOW)
     deadline = time.time() + max_seconds
@@ -3286,6 +3328,7 @@ def apply_update(force: bool = False) -> dict:
             cfg = json.load(fh)
         if isinstance(cfg, dict):
             url = str(cfg.get("version_url") or "").strip()
+            set_update_proxy(str(cfg.get("proxy") or "").strip())
     except Exception:
         pass
     if not url:
@@ -3359,8 +3402,22 @@ def apply_update_worker(repo_id: str, owner: str, repo: str, zip_urls: list,
         try:
             zip_t = os.path.join(staging, "update.zip")
             _set_apply("download", "正在下载更新包…", 0)
-            _curl_download_progress(asset_url, zip_t, 300, asset_total,
-                                    lambda p: _set_apply("download", "正在下载更新包… %d%%" % p, p))
+            # 线路：国内镜像 ×4 → GitHub 直连。哪条通走哪条，进度条上标当前线路
+            candidates = [m + asset_url for m in _GH_MIRRORS] + [asset_url]
+            last = None
+            for cu in candidates:
+                host = cu.split("/")[2]
+                try:
+                    _curl_download_progress(cu, zip_t, 150, asset_total,
+                        lambda p, h=host: _set_apply("download", "正在下载更新包… %d%%（%s）" % (p, h), p))
+                    last = None
+                    break
+                except Exception as exc:
+                    last = "线路 %s：%s" % (host, exc)
+                    _set_apply("download", "线路 %s 失败，自动换下一条…" % host, 0)
+                    _reset_staging()
+            if last:
+                raise RuntimeError(last)
             _set_apply("extract", "解压校验更新包…", 100)
             with _zf.ZipFile(zip_t) as zf:
                 names = zf.namelist()
@@ -3816,6 +3873,7 @@ def start_helper() -> None:
         return
     srv.daemon_threads = True
     threading.Thread(target=srv.serve_forever, daemon=True).start()
+    threading.Thread(target=_detect_proxy, daemon=True).start()   # 预热代理探测（更新下载用）
     log("助手服务已启动: http://%s:%d/  (LoRA 扫描 / 封面 / 工作流列表)"
         % (HELPER_HOST, HELPER_PORT))
 
@@ -4110,6 +4168,7 @@ def profile_procs():
              "Get-CimInstance Win32_Process -Filter \"Name='msedge.exe'\" | "
              "Where-Object { $_.CommandLine -like '*%s*' } | "
              "ForEach-Object { $_.ProcessId.ToString() + '|' + $_.CommandLine }" % PROFILE_MARKER],
+            creationflags=_NO_WINDOW,
             capture_output=True, text=True, errors="replace", timeout=25,
             creationflags=CREATE_NO_WINDOW,
         )
