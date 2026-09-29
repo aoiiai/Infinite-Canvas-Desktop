@@ -670,7 +670,11 @@
             -webkit-user-drag: none;
         }
 
-        /* iOS 那种"让出空位"的落点占位 */
+        /* iOS 那种"让出空位"的落点占位。
+           ⚠ 这里**不能有 animation**（2026-09-29 实测）：拖拽时 dragover 每帧都会调
+           showPlaceholderAt 把空位块 insertBefore 到落点，节点"移出再插回" = **动画重启**
+           ⇒ 那个蓝色虚线框一直闪（实测一次拖拽 22 次 DOM 变动、动画反复重播）。
+           空位块现在只在"落点真的变了"时才动（见 showPlaceholderAt 的就位判断）。 */
         .thumb-ph {
             width: 72px;
             height: 72px;
@@ -678,12 +682,6 @@
             flex: 0 0 auto;
             background: rgba(59, 130, 246, 0.08);
             border: 2px dashed rgba(59, 130, 246, 0.55);
-            animation: ph-in 0.16s var(--easing);
-        }
-
-        @keyframes ph-in {
-            from { transform: scale(0.86); opacity: 0; }
-            to { transform: scale(1); opacity: 1; }
         }
 
         /* 左上角序号 */
@@ -9045,6 +9043,7 @@
                 const d = document.createElement('div');
                 d.className = 'thumb';
                 d.draggable = true;                 // 拖动排序
+                d.dataset.id = it.id;               // 排序时不重建整行，靠 id 找回节点（见 syncThumbOrder）
                 d.title = '拖动可调整顺序 · 点击可放大';
 
                 const img = document.createElement('img');
@@ -9067,7 +9066,7 @@
                 x.onclick = (ev) => { ev.stopPropagation(); removeThumb(it.id); };
                 d.appendChild(x);
 
-                attachThumbDrag(d, i);
+                attachThumbDrag(d, it.id);
                 row.appendChild(d);
             });
             lucide.createIcons();
@@ -9108,7 +9107,29 @@
             }
             // 空位要插在"第 index 个缩略图"之前；同时要跳过空位自身
             const items = rowThumbs();
-            row.insertBefore(ph, items[index] || null);
+            const ref = items[index] || null;
+            // ⚠ 已经就位就别再动它（2026-09-29）：dragover 每帧都会调这里，无脑 insertBefore
+            //   等于把节点"移出再插回"，Chromium 会当成重新插入 ⇒ 动画/重绘反复触发 = 闪烁。
+            if (ph.parentNode === row && ph.nextSibling === ref) return;
+            row.insertBefore(ph, ref);
+        }
+
+        // 排序后**只把已有节点挪到新位置**，不重建整行（2026-09-29）：
+        // 原来走 renderThumbs() 整行重建，9 张图的 <img> 会被重新创建 → 重新解码/重新布局，
+        // 松手后要等一下才看到图归位（实测 3 张就要 23.9ms，真机 9 张照片更久）。
+        // appendChild 移动已存在的节点不会重新解码，序号就地改文字，所以是"立刻到位"。
+        function syncThumbOrder() {
+            const row = document.getElementById('thumbRow');
+            const byId = new Map();
+            rowThumbs().forEach(t => byId.set(t.dataset.id, t));
+            promptImages.forEach((it, i) => {
+                const el = byId.get(it.id);
+                if (!el) return;                       // 找不到就留给下一次 renderThumbs 兜底
+                const num = el.querySelector('.thumb-num');
+                if (num) num.textContent = String(i + 1);
+                row.appendChild(el);
+            });
+            row.style.display = 'flex';
         }
 
         function applyThumbMove(from, to) {
@@ -9120,13 +9141,15 @@
             //   拖拽结束复位代码（挂在 dragend 上）永远不跑 ⇒ 标志卡死在 true，
             //   isFileDrag() 永远 false ⇒「拖图片文件进提示词框」从此失效
             //   （用户 2026-09-29 报「提示词框图片的拖动功能失效了」）。
+            //   注：现在 drop 走 syncThumbOrder() 不再整行重建，但别的路径（加图/删图）
+            //   仍会重建，所以这条复位必须留着。
             if (from < 0 || to < 0) return;
             const moved = promptImages.splice(from, 1)[0];
             if (!moved) return;
             if (to > from) to -= 1;
             to = Math.max(0, Math.min(promptImages.length, to));
             promptImages.splice(to, 0, moved);
-            renderThumbs();               // 重排后序号也跟着变
+            syncThumbOrder();             // 就地挪节点 + 改序号（不重建 ⇒ 松手即到位）
         }
 
         // 监听挂在整行上，而不是单个缩略图上。
@@ -9165,13 +9188,15 @@
             });
         })();
 
-        function attachThumbDrag(el, index) {
+        // ⚠ 传 id 不传下标（2026-09-29）：排序后不再重建整行，闭包里那个下标会过期，
+        //   所以拖起来的瞬间按 id 现查真实位置。
+        function attachThumbDrag(el, id) {
             el.addEventListener('dragstart', (e) => {
-                dragFromIndex = index;
+                dragFromIndex = promptImages.findIndex(x => x.id === id);
                 thumbReordering = true;
                 el.classList.add('dragging');
                 e.dataTransfer.effectAllowed = 'move';
-                e.dataTransfer.setData('text/plain', String(index));  // 不设 data 某些浏览器不触发 drop
+                e.dataTransfer.setData('text/plain', String(dragFromIndex));  // 不设 data 某些浏览器不触发 drop
                 e.stopPropagation();
                 // 缓存各缩略图位置（此刻还没有空位块，位置是准的）
                 sortRects = rowThumbs().map(t => {
