@@ -2664,6 +2664,7 @@
             }
         }
         setTimeout(function () { runProjectUpdate(true); }, 8000);   // 启动后 8 秒静默检查一次
+        setTimeout(function () { checkHelperStale(); }, 3000);       // 顺便看一眼助手是不是旧代码
 
         // 文件拖入转发（2026-09-29）：外壳对 iframe 有 UI 缩放 transform，Chromium 对缩放
         // iframe 的拖放命中会错位 —— 拖进视频页的文件可能落在**外壳文档**上而不是 iframe 里。
@@ -2721,6 +2722,20 @@
             pill.title = on ? '一键更新：立即下载并应用已发现的新版本'
                             : '检查软件更新（更新源写在 AI-Studio-Data\\update_source.json 的 version_url）';
         }
+        // 助手"跑的还是旧代码"检测（2026-09-29）：更新落盘后助手仍挂在旧启动器进程里，
+        // 新功能全报"连不上助手"，用户连踩 3 次。助手 /health 会自报 stale。
+        async function checkHelperStale() {
+            try {
+                const r = await fetch(UPDATE_CHECK_HELPER + '/health', { cache: 'no-store' });
+                const d = await r.json();
+                if (d && d.stale) {
+                    updateCheckToast('程序已更新到新版，但助手还在跑旧代码 —— 请完全关掉应用窗口再重新打开');
+                    return true;
+                }
+            } catch (e) { }
+            return false;
+        }
+
         async function checkAppUpdate() {
             const pill = document.getElementById('pillUpdate');
             if (pill && pill.classList.contains('pending')) {          // 待更新态：一键直更
@@ -2738,6 +2753,7 @@
                     } catch (e) { return false; }
                 }
                 if (!await helperAlive()) { updateCheckToast('助手服务没运行'); return; }
+                if (await checkHelperStale()) return;                  // 旧助手：先让用户重启，别报"已是最新"误导
                 updateCheckToast('正在检查更新…');
                 const res = await fetch(UPDATE_CHECK_HELPER + '/check-update', { cache: 'no-store' });
                 if (!res.ok) throw new Error('HTTP ' + res.status);

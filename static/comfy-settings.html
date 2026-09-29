@@ -428,9 +428,18 @@
                 });
             }
 
-            loadLines().catch(function () {
+            loadLines().catch(function (e) {
                 var box = $('ulList');
-                if (box) box.innerHTML = '<div class="tip">连不上本地助手服务（桌面版才有这项）。</div>';
+                if (!box) return;
+                var m = String((e && e.message) || e);
+                // ⚠ 区分"接口不存在（助手还是旧进程）"和"真的连不上"（2026-09-29）：
+                //   原来一律显示"连不上本地助手服务"，用户看到新卡片却用不了，以为功能没做出来。
+                if (m === 'not found' || /404/.test(m)) {
+                    box.innerHTML = '<div class="tip">助手还是<b>旧版本</b>（没有这项接口）—— 请把应用窗口'
+                        + '<b>完全关掉</b>（不是最小化），等约 10 秒再重新打开应用，这项就能用了。</div>';
+                } else {
+                    box.innerHTML = '<div class="tip">连不上本地助手服务（桌面版才有这项）。</div>';
+                }
             });
 
             // 点过启动之后短时轮询，让「运行中」及时亮起来

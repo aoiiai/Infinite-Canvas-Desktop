@@ -3184,6 +3184,20 @@ _CURL_EXE = shutil.which("curl")         # Win10+ 自带。2026-09-29 实测：�
 
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
 
+# 本进程启动时刻（模块导入时记一次），用来判断"磁盘上的启动器文件比本进程新"
+# ⇒ 说明更新已经落盘但助手还在跑旧代码，必须重启应用。
+_PROC_START = time.time()
+
+
+def helper_code_stale() -> bool:
+    """磁盘上的启动器比本进程新？（2026-09-29 用户连更新 3 次都没重启，助手一直是旧代码，
+    新加的功能全报"连不上本地助手服务"，用户以为功能没做出来。）
+    页面启动时问一次 /health，stale=True 就直接提示"请完全关窗重开"。"""
+    try:
+        return os.path.getmtime(os.path.abspath(__file__)) > _PROC_START + 2
+    except Exception:
+        return False
+
 # —— 下载线路（2026-09-29 用户：GitHub 直连慢，接入国内镜像 + 自动探测本机代理）——
 # 镜像站套在原始 GitHub URL 前面即可加速 release/raw 下载；镜像站经常换，直连永远压轴兜底。
 # 2026-09-29 第二批（用户：更新慢得离谱 + 要在 ComfyUI 设置里选线路）：实测 ghfast.top 只有
@@ -3396,16 +3410,26 @@ def _detect_proxy() -> str:
     found = ""
     if _CURL_EXE:
         local_ports = _listening_local_ports()
-        http_cands = _env_proxy_candidates() + _system_proxy_candidates()
-        http_cands += ["http://127.0.0.1:%d" % p for p in _PROXY_CANDIDATE_PORTS]
-        http_cands += ["http://127.0.0.1:%d" % p for p in local_ports]
-        seen, uniq = set(), []
-        for c in http_cands:
-            if c not in seen:
-                seen.add(c)
-                uniq.append(c)
-        found = _race_probe(uniq)
-        if not found:                       # HTTP 代理都没有 → 同批端口再按 SOCKS5 试
+        # ① 先只探"用户明确配过的"（环境变量 + Windows 系统代理）—— 这是浏览器会用的那个，
+        #    必须优先，否则"谁先应答用谁"可能挑中另一个碰巧也能当代理的本地端口（实测挑到过 1750）。
+        explicit = []
+        for c in _env_proxy_candidates() + _system_proxy_candidates():
+            if c not in explicit:
+                explicit.append(c)
+        if explicit:
+            found = _race_probe(explicit)
+        # ② 没有显式配置（或它探不通）→ 常见端口 + netstat 里本机在监听的端口，并发探
+        if not found:
+            http_cands = ["http://127.0.0.1:%d" % p for p in _PROXY_CANDIDATE_PORTS]
+            http_cands += ["http://127.0.0.1:%d" % p for p in local_ports]
+            seen, uniq = set(), []
+            for c in http_cands:
+                if c not in seen:
+                    seen.add(c)
+                    uniq.append(c)
+            found = _race_probe(uniq)
+        # ③ HTTP 代理都没有 → 同批端口再按 SOCKS5 试一轮
+        if not found:
             socks = ["socks5h://127.0.0.1:%d" % p for p in
                      list(_PROXY_CANDIDATE_PORTS) + local_ports]
             seen2, uniq2 = set(), []
@@ -3856,10 +3880,14 @@ def apply_update_worker(repo_id: str, owner: str, repo: str, zip_urls: list,
                        result={"ok": False, "error": "应用更新失败，已回滚到还原点：%s" % exc})
             return
         shutil.rmtree(staging, ignore_errors=True)
+        # ⚠ 文案必须写清"要完全关窗再开"（2026-09-29 用户连踩 3 次）：只双击图标不会换掉
+        #   已经在跑的助手（它挂在旧启动器进程里），新功能一个都不生效，用户会以为"更新坏了"。
+        msg = ("已更新到 %s。现在请把应用窗口**完全关掉**（不是最小化），"
+               "等约 10 秒再重新打开，新功能才生效。" % latest)
         result = {"ok": True, "repo": repo_id, "current": cur, "latest": latest, "via": via,
                   "updated": updated, "backup": os.path.basename(backup_dir),
-                  "restart_required": True, "message": "已更新到 %s，请重启应用" % latest}
-        _set_apply("done", result["message"], 100, running=False, done=True, ok=True, result=result)
+                  "restart_required": True, "message": msg}
+        _set_apply("done", msg, 100, running=False, done=True, ok=True, result=result)
     except Exception as exc:      # 兜底：worker 里任何未捕获异常也要落进状态，前端才能收尾
         shutil.rmtree(staging, ignore_errors=True)
         _set_apply("failed", "更新失败", 0, running=False, done=True, ok=False,
@@ -3997,7 +4025,8 @@ class _HelperHandler(BaseHTTPRequestHandler):
         q = {k: (v[0] if v else "") for k, v in parse_qs(parts.query).items()}
         try:
             if path == "/health":
-                return self._json({"ok": True, "service": "AI Studio helper", "version": 1})
+                return self._json({"ok": True, "service": "AI Studio helper", "version": 1,
+                                   "stale": helper_code_stale()})
             if path == "/check-update":
                 return self._json(check_update())
             if path == "/apply-update/progress":
