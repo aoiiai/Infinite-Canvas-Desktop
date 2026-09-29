@@ -3588,6 +3588,93 @@ def _curl_download_progress(url: str, target: str, max_seconds: int, total: int,
             pass
 
 
+# —— 更新成功后自动重启应用（用户 2026-09-29：别让用户自己去关窗重开）——
+# 为什么不能只杀启动器：助手是启动器里的线程，而窗口还开着时新启动器会判"应用已在运行"、
+# 拉起旧窗口后自己退出 ⇒ 助手永远起不来（2026-09-29 真踩过：7 个启动器堆着、助手一直是旧的）。
+# 所以必须"关窗口 + 收启动器 + 重新拉起"三件一起做，而且这个收尾脚本得**脱离式**跑
+# （它的父进程马上要被它自己杀掉）。
+_AUTO_RESTART_SRC = '''# -*- coding: utf-8 -*-
+# 自动重启（更新成功后由启动器生成并调用；跑完自删）
+import os, subprocess, sys, time
+
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+DETACHED = 0x00000008
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def log(msg):
+    try:
+        with open(os.path.join(HERE, "desktop.log"), "a", encoding="utf-8") as fh:
+            fh.write("[%s] 自动重启: %s\\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg))
+    except Exception:
+        pass
+
+
+def main():
+    pid = int(sys.argv[1])
+    project = sys.argv[2]
+    time.sleep(3)                      # 留 3 秒让页面把"正在自动重启"显示出来
+    log("开始（旧启动器 PID=%d）" % pid)
+    # ① 关掉本应用的 Edge 窗口（命令行带 AI-Studio-Data 的，不碰用户自己的 Edge）
+    ps = ("Get-CimInstance Win32_Process -Filter \\"Name='msedge.exe'\\" | "
+          "Where-Object { $_.CommandLine -like '*AI-Studio-Data*' } | "
+          "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }")
+    try:
+        subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                       creationflags=NO_WINDOW, timeout=40)
+        log("已关闭应用窗口")
+    except Exception as exc:
+        log("关窗口失败: %s" % exc)
+    # ② 收掉旧启动器（助手线程在里面；后端是它的子进程，留着让新启动器复用）
+    try:
+        subprocess.run(["taskkill", "/F", "/PID", str(pid)],
+                       creationflags=NO_WINDOW, timeout=20)
+        log("已收掉旧启动器")
+    except Exception as exc:
+        log("收启动器失败: %s" % exc)
+    time.sleep(2.5)
+    # ③ 重新拉起启动器
+    py = os.path.join(project, "python", "pythonw.exe")
+    if not os.path.exists(py):
+        py = sys.executable
+    try:
+        subprocess.Popen([py, os.path.join(project, "AI-Studio-Desktop.pyw")],
+                         cwd=project, creationflags=DETACHED, close_fds=True)
+        log("已重新拉起启动器")
+    except Exception as exc:
+        log("重新拉起失败: %s" % exc)
+    time.sleep(1.5)
+    try:
+        os.remove(os.path.abspath(__file__))       # 自删，别在数据目录里留垃圾
+    except Exception:
+        pass
+
+
+main()
+'''
+
+
+def _spawn_auto_restart() -> bool:
+    """更新成功后自动重启：把收尾脚本写到 AI-Studio-Data 下，**脱离式**跑它。
+    返回 False 表示没起来（调用方要退回"请手动关窗重开"的提示）。"""
+    try:
+        project = PROJECT_DIR
+        script = os.path.join(state_dir(), "_auto_restart.py")
+        with open(script, "w", encoding="utf-8") as fh:
+            fh.write(_AUTO_RESTART_SRC)
+        py = os.path.join(project, "python", "pythonw.exe")
+        if not os.path.exists(py):
+            py = sys.executable
+        subprocess.Popen([py, script, str(os.getpid()), project],
+                         cwd=project, creationflags=0x00000008, close_fds=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        log("已安排更新后自动重启（收尾脚本 %s）" % script)
+        return True
+    except Exception as exc:
+        log("安排自动重启失败：%s" % exc)
+        return False
+
+
 def _update_repo_from_url(url: str):
     """从 VERSION 地址解析出 (仓库标识, zip候选源列表, (owner, repo, branch))；解析不出返回 ('', [], None)。
     支持两种写法（2026-09-28 实测本机网络：raw.githubusercontent.com 被墙连不上，
@@ -3883,13 +3970,16 @@ def apply_update_worker(repo_id: str, owner: str, repo: str, zip_urls: list,
                        result={"ok": False, "error": "应用更新失败，已回滚到还原点：%s" % exc})
             return
         shutil.rmtree(staging, ignore_errors=True)
-        # ⚠ 文案必须写清"要完全关窗再开"（2026-09-29 用户连踩 3 次）：只双击图标不会换掉
-        #   已经在跑的助手（它挂在旧启动器进程里），新功能一个都不生效，用户会以为"更新坏了"。
-        msg = ("已更新到 %s。现在请把应用窗口**完全关掉**（不是最小化），"
+        # 更新成功后**自动重启应用**（用户 2026-09-29：别让用户自己去关窗重开）。
+        # 收尾脚本会关窗口 → 收掉本启动器 → 重新拉起；助手线程随本进程一起结束，
+        # 新启动器会起一个"新代码"的助手。脚本起不来才退回手动提示。
+        auto = _spawn_auto_restart()
+        msg = ("已更新到 %s，正在自动重启应用…（窗口会关掉再自己打开）" % latest) if auto else \
+              ("已更新到 %s。自动重启没起来，请把应用窗口**完全关掉**（不是最小化），"
                "等约 10 秒再重新打开，新功能才生效。" % latest)
         result = {"ok": True, "repo": repo_id, "current": cur, "latest": latest, "via": via,
                   "updated": updated, "backup": os.path.basename(backup_dir),
-                  "restart_required": True, "message": msg}
+                  "restart_required": True, "auto_restart": bool(auto), "message": msg}
         _set_apply("done", msg, 100, running=False, done=True, ok=True, result=result)
     except Exception as exc:      # 兜底：worker 里任何未捕获异常也要落进状态，前端才能收尾
         shutil.rmtree(staging, ignore_errors=True)
