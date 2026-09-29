@@ -3198,6 +3198,57 @@ def helper_code_stale() -> bool:
     except Exception:
         return False
 
+
+# 页面里引静态资源长这样：/static/xxx.js?v=旧值（版本号是写死的）
+_V_ASSET_RE = re.compile(
+    r"(/static/[A-Za-z0-9_\-./]+\.(?:js|css|html|png|jpe?g|svg|gif|webp|woff2?))(?:\?v=([^\"'&\s]*))?")
+
+
+def refresh_asset_versions() -> int:
+    """把页面里 `/static/xxx?v=旧值` 的版本号刷成"该文件当前的 mtime"。
+    为什么必须刷（2026-09-29 用户报「我下载功能呢」）：后端是 main.py（**红线，不能改**），
+    它给静态文件只发 last-modified/etag、**不发 Cache-Control** ⇒ 浏览器按"启发式新鲜度"
+    缓存（≈ 文件年龄的 10%，放了一天的文件能缓存两小时以上），而页面里引资源用的是写死的
+    `?v=2026.09.28...` ⇒ 更新完页面照样拿旧 JS。实测：磁盘上文件 26611 字节（已含新按钮），
+    同一个 URL 再进页面拿到的还是旧副本（23478 字符）——「下载」按钮就是这么"消失"的。
+    版本号一改 URL 就变，浏览器必然重新拉；内容没变时不写盘（避免每次启动都动文件）。
+    返回改动了几个文件。"""
+    n = 0
+    try:
+        for dirpath, _dirs, files in os.walk(os.path.join(PROJECT_DIR, "static")):
+            for fn in files:
+                if not fn.lower().endswith(".html"):
+                    continue
+                path = os.path.join(dirpath, fn)
+                try:
+                    with open(path, "rb") as fh:
+                        raw = fh.read()
+                    src = raw.decode("utf-8")
+                except Exception:
+                    continue
+
+                def _sub(m):
+                    rel = m.group(1)
+                    target = os.path.join(PROJECT_DIR, *rel.lstrip("/").split("/"))
+                    try:
+                        tok = str(int(os.path.getmtime(target)))
+                    except Exception:
+                        return m.group(0)
+                    if m.group(2) == tok:
+                        return m.group(0)
+                    return "%s?v=%s" % (rel, tok)
+
+                new = _V_ASSET_RE.sub(_sub, src)
+                if new != src:
+                    with open(path, "wb") as fh:
+                        fh.write(new.encode("utf-8"))
+                    n += 1
+    except Exception as exc:
+        log("刷新静态资源版本号失败：%s" % exc)
+    if n:
+        log("已刷新 %d 个页面的静态资源版本号（强制浏览器重新拉）" % n)
+    return n
+
 # —— 下载线路（2026-09-29 用户：GitHub 直连慢，接入国内镜像 + 自动探测本机代理）——
 # 镜像站套在原始 GitHub URL 前面即可加速 release/raw 下载；镜像站经常换，直连永远压轴兜底。
 # 2026-09-29 第二批（用户：更新慢得离谱 + 要在 ComfyUI 设置里选线路）：实测 ghfast.top 只有
@@ -4949,6 +5000,7 @@ def main() -> int:
     log("项目目录: %s" % PROJECT_DIR)
 
     apply_ui_changes()
+    refresh_asset_versions()      # 静态资源版本号跟着文件走（否则浏览器吃旧缓存，见函数注释）
     ensure_backend_script()
     start_helper()
 
@@ -5024,6 +5076,7 @@ if __name__ == "__main__":
         print("要隐藏的功能页:", ", ".join(FEATURE_HIDES) or "(无)")
         result = apply_ui_changes(verbose=True)
         print("本次改动:", result or "无")
+        print("刷新静态资源版本号的页面数:", refresh_asset_versions())
         sys.exit(0)
     # 只起助手服务，方便单独调试 LoRA 扫描
     if "--helper" in sys.argv:

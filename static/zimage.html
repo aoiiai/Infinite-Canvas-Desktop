@@ -4,7 +4,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <link rel="icon" href="/static/images/logo.png" type="image/png">
+    <link rel="icon" href="/static/images/logo.png?v=1790615738" type="image/png">
     <title>Flux Modern Gallery | Unified Console</title>
     <script>
         (function(){
@@ -17,13 +17,13 @@
             } catch(e) {}
         })();
     </script>
-    <script src="/static/vendor/js/tailwindcss-cdn.js?v=2026.09.28.1790212944"></script>
-    <script src="/static/vendor/js/lucide.js?v=2026.09.28.1790212942"></script>
-    <script src="/static/js/theme.js?v=2026.09.28.1790212920"></script>
-    <script src="/static/js/ui-dialogs.js?v=2026.09.28.1790572072"></script><!-- 自制弹窗：接管 window.alert，提供 uiAlert/uiConfirm/uiPrompt（禁用系统弹窗） -->
-    <script src="/static/js/i18n.js?v=2026.09.28.1790212904"></script>
-    <script src="/static/js/image-preview.js?v=2026.09.28.1790212908"></script>
-    <script src="/static/js/history-bulk-manager.js?v=2026.09.28.1790212904"></script>
+    <script src="/static/vendor/js/tailwindcss-cdn.js?v=1790615738"></script>
+    <script src="/static/vendor/js/lucide.js?v=1790615738"></script>
+    <script src="/static/js/theme.js?v=1790615738"></script>
+    <script src="/static/js/ui-dialogs.js?v=1790615738"></script><!-- 自制弹窗：接管 window.alert，提供 uiAlert/uiConfirm/uiPrompt（禁用系统弹窗） -->
+    <script src="/static/js/i18n.js?v=1790615738"></script>
+    <script src="/static/js/image-preview.js?v=1790615738"></script>
+    <script src="/static/js/history-bulk-manager.js?v=1790615738"></script>
     <style>
         :root {
             --bg-base: #f8f8f8;
@@ -176,7 +176,7 @@
             display: none;
         }
     </style>
-    <link rel="stylesheet" href="/static/css/theme.css?v=2026.09.28.1790212890">
+    <link rel="stylesheet" href="/static/css/theme.css?v=1790615738">
 </head>
 
 <body class="antialiased">
@@ -492,7 +492,7 @@
             card.onclick = () => { if(document.body.classList.contains('history-bulk-selecting')) return; openLightbox(data.images[0], data.prompt); };
             card.innerHTML = `
             <img src="${data.images[0]}" class="w-full h-full object-cover" loading="lazy">
-            ${data.type === 'cloud' ? '<div class="absolute top-3 left-3 z-10"><img src="/static/images/modelscope.gif" class="h-4 w-auto object-contain bg-white/90 rounded-full p-0.5 shadow-sm"></div>' : ''}
+            ${data.type === 'cloud' ? '<div class="absolute top-3 left-3 z-10"><img src="/static/images/modelscope.gif?v=1790615738" class="h-4 w-auto object-contain bg-white/90 rounded-full p-0.5 shadow-sm"></div>' : ''}
         `;
             isNew ? masonry.prepend(card) : masonry.appendChild(card);
             lucide.createIcons();
