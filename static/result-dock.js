@@ -502,5 +502,3 @@ video.rd-nopip::-webkit-media-controls-picture-in-picture-button { display: none
     // 不再各写一套放大逻辑（2026-09-26）
     return { mount: mount, pickMedia: pickMedia, mediaKind: mediaKind, openLightbox: openLightbox };
 })();
-
-// cache-test-marker
