@@ -9099,6 +9099,12 @@
         function applyThumbMove(from, to) {
             removePlaceholder();
             dragFromIndex = -1;
+            thumbReordering = false;
+            // ⚠ 必须在这里复位 thumbReordering：drop 后 renderThumbs() 会整行重建，
+            //   原缩略图元素脱离 DOM ⇒ Chromium 对已脱离元素**不派发 dragend** ⇒
+            //   拖拽结束复位代码（挂在 dragend 上）永远不跑 ⇒ 标志卡死在 true，
+            //   isFileDrag() 永远 false ⇒「拖图片文件进提示词框」从此失效
+            //   （用户 2026-09-29 报「提示词框图片的拖动功能失效了」）。
             if (from < 0 || to < 0) return;
             const moved = promptImages.splice(from, 1)[0];
             if (!moved) return;
@@ -9114,6 +9120,16 @@
         (function initThumbRowSort() {
             const row = document.getElementById('thumbRow');
             if (!row) return;
+            // 兜底：拖拽在别处结束（Esc / 拖出窗口 / 落到别的元素）时也要复位。
+            // dragend 不被 stopPropagation，window 捕获一定能收到；源元素脱离 DOM 的极端情况
+            // 已由 applyThumbMove 里的复位兜住（那才是唯一的丢 dragend 路径）。
+            window.addEventListener('dragend', () => {
+                if (!thumbReordering) return;
+                thumbReordering = false;
+                dragFromIndex = -1;
+                removePlaceholder();
+                document.getElementById('promptDrop').classList.remove('drop-active');
+            }, true);
             row.addEventListener('dragover', (e) => {
                 if (!thumbReordering) return;
                 e.preventDefault();
